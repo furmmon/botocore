@@ -14,6 +14,8 @@ import re
 import copy
 import logging
 
+from datadog import statsd
+
 import botocore.serialize
 import botocore.validate
 from botocore import waiter, xform_name
@@ -305,6 +307,7 @@ class BaseClient(object):
         return self.meta.service_model
 
     def _make_api_call(self, operation_name, api_params):
+        statsd.increment('boto.request', tags=["action:%s" % operation_name])
         operation_model = self._service_model.operation_model(operation_name)
         request_dict = self._convert_to_request_dict(
             api_params, operation_model)
