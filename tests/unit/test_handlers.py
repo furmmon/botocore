@@ -19,6 +19,7 @@ import copy
 
 import botocore
 import botocore.session
+from botocore.exceptions import ParamValidationError
 from botocore.awsrequest import AWSRequest
 from botocore.compat import quote, six
 from botocore.model import OperationModel, ServiceModel
@@ -39,6 +40,15 @@ class TestHandlers(BaseSessionTest):
         handlers.decode_console_output(parsed)
         self.assertEqual(parsed['Output'], 1)
 
+    def test_noop_if_output_key_does_not_exist(self):
+        original = {'foo': 'bar'}
+        parsed = original.copy()
+
+        handlers.decode_console_output(parsed)
+        # Should be unchanged because the 'Output'
+        # key is not in the output.
+        self.assertEqual(parsed, original)
+
     def test_decode_quoted_jsondoc(self):
         value = quote('{"foo":"bar"}')
         converted_value = handlers.decode_quoted_jsondoc(value)
@@ -52,29 +62,58 @@ class TestHandlers(BaseSessionTest):
     def test_disable_signing(self):
         self.assertEqual(handlers.disable_signing(), botocore.UNSIGNED)
 
-    def test_quote_source_header(self):
-        for op in ('UploadPartCopy', 'CopyObject'):
-            event = 'before-call.s3.%s' % op
-            params = {'headers': {'x-amz-copy-source': 'foo++bar.txt'}}
-            m = mock.Mock()
-            self.session.emit(event, params=params, model=m)
-            self.assertEqual(
-                params['headers']['x-amz-copy-source'], 'foo%2B%2Bbar.txt')
-
-    def test_only_quote_url_path_not_query_string(self):
-        request = {
-            'headers': {'x-amz-copy-source': '/foo/bar++baz?versionId=123'}
-        }
-        handlers.quote_source_header(request)
-        self.assertEqual(request['headers']['x-amz-copy-source'],
+    def test_only_quote_url_path_not_version_id(self):
+        params = {'CopySource': '/foo/bar++baz?versionId=123'}
+        handlers.handle_copy_source_param(params)
+        self.assertEqual(params['CopySource'],
                          '/foo/bar%2B%2Bbaz?versionId=123')
 
-    def test_quote_source_header_needs_no_changes(self):
-        request = {
-            'headers': {'x-amz-copy-source': '/foo/bar?versionId=123'}
+    def test_only_version_id_is_special_cased(self):
+        params = {'CopySource': '/foo/bar++baz?notVersion=foo+'}
+        handlers.handle_copy_source_param(params)
+        self.assertEqual(params['CopySource'],
+                         '/foo/bar%2B%2Bbaz%3FnotVersion%3Dfoo%2B')
+
+    def test_copy_source_with_multiple_questions(self):
+        params = {'CopySource': '/foo/bar+baz?a=baz+?versionId=a+'}
+        handlers.handle_copy_source_param(params)
+        self.assertEqual(params['CopySource'],
+                         '/foo/bar%2Bbaz%3Fa%3Dbaz%2B?versionId=a+')
+
+    def test_copy_source_supports_dict(self):
+        params = {
+            'CopySource': {'Bucket': 'foo', 'Key': 'keyname+'}
         }
-        handlers.quote_source_header(request)
-        self.assertEqual(request['headers']['x-amz-copy-source'],
+        handlers.handle_copy_source_param(params)
+        self.assertEqual(params['CopySource'], 'foo/keyname%2B')
+
+    def test_copy_source_ignored_if_not_dict(self):
+        params = {
+            'CopySource': 'stringvalue'
+        }
+        handlers.handle_copy_source_param(params)
+        self.assertEqual(params['CopySource'], 'stringvalue')
+
+    def test_copy_source_supports_optional_version_id(self):
+        params = {
+            'CopySource': {'Bucket': 'foo',
+                           'Key': 'keyname+',
+                           'VersionId': 'asdf+'}
+        }
+        handlers.handle_copy_source_param(params)
+        self.assertEqual(params['CopySource'],
+                         # Note, versionId is not url encoded.
+                         'foo/keyname%2B?versionId=asdf+')
+
+    def test_copy_source_has_validation_failure(self):
+        with self.assertRaisesRegexp(ParamValidationError, 'Key'):
+            handlers.handle_copy_source_param(
+                {'CopySource': {'Bucket': 'foo'}})
+
+    def test_quote_source_header_needs_no_changes(self):
+        params = {'CopySource': '/foo/bar?versionId=123'}
+        handlers.handle_copy_source_param(params)
+        self.assertEqual(params['CopySource'],
                          '/foo/bar?versionId=123')
 
     def test_presigned_url_already_present(self):
@@ -85,7 +124,7 @@ class TestHandlers(BaseSessionTest):
     def test_copy_snapshot_encrypted(self):
         credentials = Credentials('key', 'secret')
         request_signer = RequestSigner(
-            'ec2', 'us-east-1', 'ec2', 'v4', credentials, None)
+            'ec2', 'us-east-1', 'ec2', 'v4', credentials, mock.Mock())
         request_dict = {}
         params = {'SourceRegion': 'us-west-2'}
         request_dict['body'] = params
@@ -111,7 +150,7 @@ class TestHandlers(BaseSessionTest):
 
         credentials = Credentials('key', 'secret')
         request_signer = RequestSigner(
-            'ec2', actual_region, 'ec2', 'v4', credentials, None)
+            'ec2', actual_region, 'ec2', 'v4', credentials, mock.Mock())
         request_dict = {}
         params = {
             'SourceRegion': 'us-west-2',
@@ -177,6 +216,25 @@ class TestHandlers(BaseSessionTest):
         self.session.emit(event, params=params, model=mock.Mock())
         self.assertEqual(params['SSECustomerKey'], 'YmFy')
         self.assertEqual(params['SSECustomerKeyMD5'],
+                         'N7UdGUp1E+RbVvZSTy1R8g==')
+
+    def test_copy_source_sse_params(self):
+        for op in ['CopyObject', 'UploadPartCopy']:
+            event = 'before-parameter-build.s3.%s' % op
+            params = {'CopySourceSSECustomerKey': b'bar',
+                      'CopySourceSSECustomerAlgorithm': 'AES256'}
+            self.session.emit(event, params=params, model=mock.Mock())
+            self.assertEqual(params['CopySourceSSECustomerKey'], 'YmFy')
+            self.assertEqual(params['CopySourceSSECustomerKeyMD5'],
+                             'N7UdGUp1E+RbVvZSTy1R8g==')
+
+    def test_copy_source_sse_params_as_str(self):
+        event = 'before-parameter-build.s3.CopyObject'
+        params = {'CopySourceSSECustomerKey': 'bar',
+                  'CopySourceSSECustomerAlgorithm': 'AES256'}
+        self.session.emit(event, params=params, model=mock.Mock())
+        self.assertEqual(params['CopySourceSSECustomerKey'], 'YmFy')
+        self.assertEqual(params['CopySourceSSECustomerKeyMD5'],
                          'N7UdGUp1E+RbVvZSTy1R8g==')
 
     def test_route53_resource_id(self):
@@ -381,6 +439,13 @@ class TestHandlers(BaseSessionTest):
         self.assertEqual(request_dict['headers']['x-amz-glacier-version'],
                          '2012-01-01')
 
+    def test_application_json_header_added(self):
+        request_dict = {
+            'headers': {}
+        }
+        handlers.add_accept_header(None, request_dict)
+        self.assertEqual(request_dict['headers']['Accept'], 'application/json')
+
     def test_glacier_checksums_added(self):
         request_dict = {
             'headers': {},
@@ -446,7 +511,7 @@ class TestHandlers(BaseSessionTest):
     def test_does_not_add_md5_when_v4(self):
         credentials = Credentials('key', 'secret')
         request_signer = RequestSigner(
-            's3', 'us-east-1', 's3', 'v4', credentials, None)
+            's3', 'us-east-1', 's3', 'v4', credentials, mock.Mock())
         request_dict = {'body': b'bar',
                         'url': 'https://s3.us-east-1.amazonaws.com',
                         'method': 'PUT',
@@ -458,7 +523,7 @@ class TestHandlers(BaseSessionTest):
     def test_adds_md5_when_not_v4(self):
         credentials = Credentials('key', 'secret')
         request_signer = RequestSigner(
-            's3', 'us-east-1', 's3', 's3', credentials, None)
+            's3', 'us-east-1', 's3', 's3', credentials, mock.Mock())
         request_dict = {'body': b'bar',
                         'url': 'https://s3.us-east-1.amazonaws.com',
                         'method': 'PUT',
@@ -485,6 +550,112 @@ class TestHandlers(BaseSessionTest):
         self.assertEqual(
             request_dict['headers']['Content-MD5'],
             'OFj2IjCsPJFfMAxmQxLGPw==')
+
+    def test_invalid_char_in_bucket_raises_exception(self):
+        params = {
+            'Bucket': 'bad/bucket/name',
+            'Key': 'foo',
+            'Body': b'asdf',
+        }
+        with self.assertRaises(ParamValidationError):
+            handlers.validate_bucket_name(params)
+
+    def test_bucket_too_long_raises_exception(self):
+        params = {
+            'Bucket': 'a' * 300,
+            'Key': 'foo',
+            'Body': b'asdf',
+        }
+        with self.assertRaises(ParamValidationError):
+            handlers.validate_bucket_name(params)
+
+    def test_not_dns_compat_but_still_valid_bucket_name(self):
+        params = {
+            'Bucket': 'foasdf......bar--baz-a_b_CD10',
+            'Key': 'foo',
+            'Body': b'asdf',
+        }
+        self.assertIsNone(handlers.validate_bucket_name(params))
+
+    def test_valid_bucket_name_hyphen(self):
+        self.assertIsNone(
+            handlers.validate_bucket_name({'Bucket': 'my-bucket-name'}))
+
+    def test_valid_bucket_name_underscore(self):
+        self.assertIsNone(
+            handlers.validate_bucket_name({'Bucket': 'my_bucket_name'}))
+
+    def test_valid_bucket_name_period(self):
+        self.assertIsNone(
+            handlers.validate_bucket_name({'Bucket': 'my.bucket.name'}))
+
+    def test_validation_is_noop_if_no_bucket_param_exists(self):
+        self.assertIsNone(handlers.validate_bucket_name(params={}))
+
+    def test_set_encoding_type(self):
+        params = {}
+        context = {}
+        handlers.set_list_objects_encoding_type_url(params, context=context)
+        self.assertEqual(params['EncodingType'], 'url')
+        self.assertTrue(context['EncodingTypeAutoSet'])
+
+        params['EncodingType'] = 'new_value'
+        handlers.set_list_objects_encoding_type_url(params, context={})
+        self.assertEqual(params['EncodingType'], 'new_value')
+
+    def test_decode_list_objects(self):
+        parsed = {
+            'Contents': [{'Key': "%C3%A7%C3%B6s%25asd%08"}],
+            'EncodingType': 'url',
+        }
+        context = {'EncodingTypeAutoSet': True}
+        handlers.decode_list_object(parsed, context=context)
+        self.assertEqual(parsed['Contents'][0]['Key'], u'\xe7\xf6s%asd\x08')
+
+    def test_decode_list_objects_does_not_decode_without_context(self):
+        parsed = {
+            'Contents': [{'Key': "%C3%A7%C3%B6s%25asd"}],
+            'EncodingType': 'url',
+        }
+        handlers.decode_list_object(parsed, context={})
+        self.assertEqual(parsed['Contents'][0]['Key'], u'%C3%A7%C3%B6s%25asd')
+
+    def test_decode_list_objects_with_marker(self):
+        parsed = {
+            'Marker': "%C3%A7%C3%B6s%25%20asd%08+c",
+            'EncodingType': 'url',
+        }
+        context = {'EncodingTypeAutoSet': True}
+        handlers.decode_list_object(parsed, context=context)
+        self.assertEqual(parsed['Marker'], u'\xe7\xf6s% asd\x08 c')
+
+    def test_decode_list_objects_with_nextmarker(self):
+        parsed = {
+            'NextMarker': "%C3%A7%C3%B6s%25%20asd%08+c",
+            'EncodingType': 'url',
+        }
+        context = {'EncodingTypeAutoSet': True}
+        handlers.decode_list_object(parsed, context=context)
+        self.assertEqual(parsed['NextMarker'], u'\xe7\xf6s% asd\x08 c')
+
+    def test_decode_list_objects_with_common_prefixes(self):
+        parsed = {
+            'CommonPrefixes': [{'Prefix': "%C3%A7%C3%B6s%25%20asd%08+c"}],
+            'EncodingType': 'url',
+        }
+        context = {'EncodingTypeAutoSet': True}
+        handlers.decode_list_object(parsed, context=context)
+        self.assertEqual(parsed['CommonPrefixes'][0]['Prefix'],
+                         u'\xe7\xf6s% asd\x08 c')
+
+    def test_decode_list_objects_with_delimiter(self):
+        parsed = {
+            'Delimiter': "%C3%A7%C3%B6s%25%20asd%08+c",
+            'EncodingType': 'url',
+        }
+        context = {'EncodingTypeAutoSet': True}
+        handlers.decode_list_object(parsed, context=context)
+        self.assertEqual(parsed['Delimiter'], u'\xe7\xf6s% asd\x08 c')
 
 
 class TestRetryHandlerOrder(BaseSessionTest):

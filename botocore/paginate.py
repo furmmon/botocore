@@ -13,7 +13,11 @@
 
 from itertools import tee
 
+from six import string_types
+
 import jmespath
+import json
+import base64
 from botocore.exceptions import PaginationError
 from botocore.compat import zip
 from botocore.utils import set_value_from_jmespath, merge_dicts
@@ -62,8 +66,20 @@ class PageIterator(object):
 
     @resume_token.setter
     def resume_token(self, value):
-        if isinstance(value, list):
-            self._resume_token = '___'.join([str(v) for v in value])
+        if not isinstance(value, dict):
+            raise ValueError("Bad starting token: %s" % value)
+
+        if 'boto_truncate_amount' in value:
+            token_keys = sorted(self._input_token + ['boto_truncate_amount'])
+        else:
+            token_keys = sorted(self._input_token)
+        dict_keys = sorted(value.keys())
+
+        if token_keys == dict_keys:
+            self._resume_token = base64.b64encode(
+                json.dumps(value).encode('utf-8')).decode('utf-8')
+        else:
+            raise ValueError("Bad starting token: %s" % value)
 
     @property
     def non_aggregate_part(self):
@@ -72,7 +88,7 @@ class PageIterator(object):
     def __iter__(self):
         current_kwargs = self._op_kwargs
         previous_next_token = None
-        next_token = [None for _ in range(len(self._input_token))]
+        next_token = dict((key, None) for key in self._input_token)
         # The number of items from result_key we've seen so far.
         total_items = 0
         first_request = True
@@ -98,7 +114,7 @@ class PageIterator(object):
             truncate_amount = 0
             if self._max_items is not None:
                 truncate_amount = (total_items + num_current_response) \
-                    - self._max_items
+                                  - self._max_items
             if truncate_amount > 0:
                 self._truncate_response(parsed, primary_result_key,
                                         truncate_amount, starting_truncation,
@@ -109,16 +125,16 @@ class PageIterator(object):
                 yield response
                 total_items += num_current_response
                 next_token = self._get_next_token(parsed)
-                if all(t is None for t in next_token):
+                if all(t is None for t in next_token.values()):
                     break
                 if self._max_items is not None and \
-                        total_items == self._max_items:
+                                total_items == self._max_items:
                     # We're on a page boundary so we can set the current
                     # next token to be the resume token.
                     self.resume_token = next_token
                     break
                 if previous_next_token is not None and \
-                        previous_next_token == next_token:
+                                previous_next_token == next_token:
                     message = ("The same next token was received "
                                "twice: %s" % next_token)
                     raise PaginationError(message=message)
@@ -180,21 +196,25 @@ class PageIterator(object):
             op_kwargs[self._limit_key] = self._page_size
 
     def _inject_token_into_kwargs(self, op_kwargs, next_token):
-        for name, token in zip(self._input_token, next_token):
+        for name, token in next_token.items():
             if token is None or token == 'None':
                 continue
             op_kwargs[name] = token
 
     def _handle_first_request(self, parsed, primary_result_key,
                               starting_truncation):
-        # First we need to slice into the array and only return
-        # the truncated amount.
+        # If the payload is an array or string, we need to slice into it
+        # and only return the truncated amount.
         starting_truncation = self._parse_starting_token()[1]
         all_data = primary_result_key.search(parsed)
+        if isinstance(all_data, (list, string_types)):
+            data = all_data[starting_truncation:]
+        else:
+            data = None
         set_value_from_jmespath(
             parsed,
             primary_result_key.expression,
-            all_data[starting_truncation:]
+            data
         )
         # We also need to truncate any secondary result keys
         # because they were not truncated in the previous last
@@ -202,7 +222,16 @@ class PageIterator(object):
         for token in self.result_keys:
             if token == primary_result_key:
                 continue
-            set_value_from_jmespath(parsed, token.expression, [])
+            sample = token.search(parsed)
+            if isinstance(sample, list):
+                empty_value = []
+            elif isinstance(sample, string_types):
+                empty_value = ''
+            elif isinstance(sample, (int, float)):
+                empty_value = 0
+            else:
+                empty_value = None
+            set_value_from_jmespath(parsed, token.expression, empty_value)
         return starting_truncation
 
     def _truncate_response(self, parsed, primary_result_key, truncate_amount,
@@ -228,22 +257,24 @@ class PageIterator(object):
         # However, even though we only kept 1, this is post
         # left truncation so the next starting index should be 2, not 1
         # (left_truncation + amount_to_keep).
-        next_token.append(str(amount_to_keep + starting_truncation))
+        next_token['boto_truncate_amount'] = \
+            amount_to_keep + starting_truncation
         self.resume_token = next_token
 
     def _get_next_token(self, parsed):
         if self._more_results is not None:
             if not self._more_results.search(parsed):
-                return [None]
-        next_tokens = []
-        for token in self._output_token:
-            next_token = token.search(parsed)
+                return {}
+        next_tokens = {}
+        for output_token, input_key in \
+                zip(self._output_token, self._input_token):
+            next_token = output_token.search(parsed)
             # We do not want to include any empty strings as actual tokens.
             # Treat them as None.
             if next_token:
-                next_tokens.append(next_token)
+                next_tokens[input_key] = next_token
             else:
-                next_tokens.append(None)
+                next_tokens[input_key] = None
         return next_tokens
 
     def result_key_iters(self):
@@ -253,10 +284,6 @@ class PageIterator(object):
 
     def build_full_result(self):
         complete_result = {}
-        # Prepopulate the result keys with an empty list.
-        for result_expression in self.result_keys:
-            set_value_from_jmespath(complete_result,
-                                    result_expression.expression, [])
         for response in self:
             page = response
             # We want to try to catch operation object pagination
@@ -277,10 +304,24 @@ class PageIterator(object):
                 # current result key value.  Then we append the current
                 # value onto the existing value, and re-set that value
                 # as the new value.
-                existing_value = result_expression.search(complete_result)
                 result_value = result_expression.search(page)
-                if result_value is not None:
+                if result_value is None:
+                    continue
+                existing_value = result_expression.search(complete_result)
+                if existing_value is None:
+                    # Set the initial result
+                    set_value_from_jmespath(
+                        complete_result, result_expression.expression,
+                        result_value)
+                    continue
+                # Now both result_value and existing_value contain something
+                if isinstance(result_value, list):
                     existing_value.extend(result_value)
+                elif isinstance(result_value, (int, float, string_types)):
+                    # Modify the existing result with the sum or concatenation
+                    set_value_from_jmespath(
+                        complete_result, result_expression.expression,
+                        existing_value + result_value)
         merge_dicts(complete_result, self.non_aggregate_part)
         if self.resume_token is not None:
             complete_result['NextToken'] = self.resume_token
@@ -289,26 +330,22 @@ class PageIterator(object):
     def _parse_starting_token(self):
         if self._starting_token is None:
             return None
-        parts = self._starting_token.split('___')
-        next_token = []
-        index = 0
-        if len(parts) == len(self._input_token) + 1:
-            try:
-                index = int(parts.pop())
-            except ValueError:
-                raise ValueError("Bad starting token: %s" %
-                                 self._starting_token)
-        for part in parts:
-            if part == 'None':
-                next_token.append(None)
-            else:
-                next_token.append(part)
+
+        # The starting token is a dict passed as a base64 encoded string.
+        next_token = self._starting_token
+        try:
+            next_token = json.loads(
+                base64.b64decode(next_token).decode('utf-8'))
+            index = 0
+            if 'boto_truncate_amount' in next_token:
+                index = next_token.get('boto_truncate_amount')
+                del next_token['boto_truncate_amount']
+        except (ValueError, TypeError):
+            raise ValueError("Bad starting token: %s" % self._starting_token)
         return next_token, index
 
 
-
 class Paginator(object):
-
     PAGE_ITERATOR_CLS = PageIterator
 
     def __init__(self, method, pagination_config):
@@ -397,7 +434,6 @@ class Paginator(object):
         }
 
 
-
 class ResultKeyIterator(object):
     """Iterates over the results of paginated responses.
 
@@ -411,6 +447,7 @@ class ResultKeyIterator(object):
         the result key.
 
     """
+
     def __init__(self, pages_iterator, result_key):
         self._pages_iterator = pages_iterator
         self.result_key = result_key

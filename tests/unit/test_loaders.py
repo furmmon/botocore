@@ -24,7 +24,7 @@ import contextlib
 
 import mock
 
-from botocore.exceptions import DataNotFoundError
+from botocore.exceptions import DataNotFoundError, UnknownServiceError
 from botocore.loaders import JSONFileLoader
 from botocore.loaders import Loader, create_loader
 
@@ -55,6 +55,13 @@ class TestJSONFileLoader(BaseEnvVar):
         self.assertFalse(self.file_loader.exists(
             os.path.join(self.data_path, 'does', 'not', 'exist')))
 
+    def test_file_with_non_ascii(self):
+        try:
+            filename = os.path.join(self.data_path, 'non_ascii')
+            self.assertTrue(self.file_loader.load_file(filename) is not None)
+        except UnicodeDecodeError:
+            self.fail('Fail to handle data file with non-ascii characters')
+
 
 class TestLoader(BaseEnvVar):
 
@@ -77,12 +84,12 @@ class TestLoader(BaseEnvVar):
 
     def test_can_initialize_with_search_paths(self):
         loader = Loader(extra_search_paths=['foo', 'bar'])
-        self.assertIn('foo', loader.search_paths)
-        self.assertIn('bar', loader.search_paths)
-        # We should also always add the default search
-        # paths even if the loader is initialized with
-        # additional search paths.
-        self.assertEqual(len(loader.search_paths), 4)
+        # Note that the extra search paths are before
+        # the customer/builtin data paths.
+        self.assertEqual(
+            loader.search_paths,
+            ['foo', 'bar', loader.CUSTOMER_DATA_PATH,
+             loader.BUILTIN_DATA_PATH])
 
     # The file loader isn't consulted unless the current
     # search path exists, so we're patching isdir to always
@@ -129,8 +136,27 @@ class TestLoader(BaseEnvVar):
                         file_loader=FakeLoader(),
                         include_default_search_paths=False)
         loader.determine_latest_version = mock.Mock(return_value='2015-03-01')
+        loader.list_available_services = mock.Mock(return_value=['baz'])
         loaded = loader.load_service_model('baz', type_name='service-2')
         self.assertEqual(loaded, ['loaded data'])
+
+    @mock.patch('os.path.isdir', mock.Mock(return_value=True))
+    def test_load_service_model_enforces_case(self):
+        class FakeLoader(object):
+            def load_file(self, name):
+                return ['loaded data']
+
+        loader = Loader(extra_search_paths=['foo'],
+                        file_loader=FakeLoader(),
+                        include_default_search_paths=False)
+        loader.determine_latest_version = mock.Mock(return_value='2015-03-01')
+        loader.list_available_services = mock.Mock(return_value=['baz'])
+
+        # Should have a) the unknown service name and b) list of valid
+        # service names.
+        with self.assertRaisesRegexp(UnknownServiceError,
+                                     'Unknown service.*BAZ.*baz'):
+            loader.load_service_model('BAZ', type_name='service-2')
 
     def test_create_loader_parses_data_path(self):
         search_path = os.pathsep.join(['foo', 'bar', 'baz'])

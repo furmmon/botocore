@@ -60,9 +60,9 @@ class Session(object):
     #: are tuples of (<config_name>, <environment variable>, <default value>,
     #: <conversion func>).
     #: The conversion func is a function that takes the configuration value
-    #: as an arugment and returns the converted value.  If this value is
+    #: as an argument and returns the converted value.  If this value is
     #: None, then the configuration value is returned unmodified.  This
-    #: conversion function that be used to type convert config values to
+    #: conversion function can be used to type convert config values to
     #: values other than the default values of strings.
     #: The ``profile`` and ``config_file`` variables should always have a
     #: None value for the first entry in the tuple because it doesn't make
@@ -78,22 +78,22 @@ class Session(object):
         'region': ('region', 'AWS_DEFAULT_REGION', None, None),
         'data_path': ('data_path', 'AWS_DATA_PATH', None, None),
         'config_file': (None, 'AWS_CONFIG_FILE', '~/.aws/config', None),
+        'ca_bundle': ('ca_bundle', 'AWS_CA_BUNDLE', None, None),
 
-        # These variables are intended for internal use so don't have any
-        # user settable values.
         # This is the shared credentials file amongst sdks.
-        'credentials_file': (None, None, '~/.aws/credentials', None),
+        'credentials_file': (None, 'AWS_SHARED_CREDENTIALS_FILE',
+                             '~/.aws/credentials', None),
 
         # These variables only exist in the config file.
 
         # This is the number of seconds until we time out a request to
         # the instance metadata service.
         'metadata_service_timeout': ('metadata_service_timeout',
-                                     None, 1, int),
+                                     'AWS_METADATA_SERVICE_TIMEOUT', 1, int),
         # This is the number of request attempts we make until we give
         # up trying to retrieve data from the instance metadata service.
         'metadata_service_num_attempts': ('metadata_service_num_attempts',
-                                          None, 1, int),
+                                          'AWS_METADATA_SERVICE_NUM_ATTEMPTS', 1, int),
     }
 
     #: The default format string to use when configuring the botocore logger.
@@ -137,13 +137,19 @@ class Session(object):
         self.user_agent_name = 'Botocore'
         self.user_agent_version = __version__
         self.user_agent_extra = ''
-        self._profile = profile
+        # The _profile attribute is just used to cache the value
+        # of the current profile to avoid going through the normal
+        # config lookup process each access time.
+        self._profile = None
         self._config = None
         self._credentials = None
         self._profile_map = None
         # This is a dict that stores per session specific config variable
         # overrides via set_config_variable().
         self._session_instance_vars = {}
+        if profile is not None:
+            self._session_instance_vars['profile'] = profile
+        self._client_config = None
         self._components = ComponentLocator()
         self._register_components()
 
@@ -234,9 +240,6 @@ class Session(object):
         # Handle all the short circuit special cases first.
         if logical_name not in self.session_var_map:
             return
-        if logical_name == 'profile' and self._profile:
-            return self._profile
-
         # Do the actual lookups.  We need to handle
         # 'instance', 'env', and 'config' locations, in that order.
         value = None
@@ -375,6 +378,26 @@ class Session(object):
             except ConfigNotFound:
                 pass
         return self._config
+
+    def get_default_client_config(self):
+        """Retrieves the default config for creating clients
+
+        :rtype: botocore.client.Config
+        :returns: The default client config object when creating clients. If
+            the value is ``None`` then there is no default config object
+            attached to the session.
+        """
+        return self._client_config
+
+    def set_default_client_config(self, client_config):
+        """Sets the default config for creating clients
+
+        :type client_config: botocore.client.Config
+        :param client_config: The default client config object when creating
+            clients. If the value is ``None`` then there is no default config
+            object attached to the session.
+        """
+        self._client_config = client_config
 
     def set_credentials(self, access_key, secret_key, token=None):
         """
@@ -725,20 +748,41 @@ class Session(object):
             the client.  Same semantics as aws_access_key_id above.
 
         :type config: botocore.client.Config
-        :param config: Advanced client configuration options. If region_name
+        :param config: Advanced client configuration options. If a value
             is specified in the client config, its value will take precedence
             over environment variables and configuration values, but not over
-            a region_name value passed explicitly to the method.
+            a value passed explicitly to the method. If a default config
+            object is set on the session, the config object used when creating
+            the client will be the result of calling ``merge()`` on the
+            default config with the config provided to this call.
 
         :rtype: botocore.client.BaseClient
         :return: A botocore client instance
 
         """
+        default_client_config = self.get_default_client_config()
+        # If a config is provided and a default config is set, then
+        # use the config resulting from merging the two.
+        if config is not None and default_client_config is not None:
+            config = default_client_config.merge(config)
+        # If a config was not provided then use the default
+        # client config from the session
+        elif default_client_config is not None:
+            config = default_client_config
+
+        # Figure out the user-provided region based on the various
+        # configuration options.
         if region_name is None:
             if config and config.region_name is not None:
                 region_name = config.region_name
             else:
                 region_name = self.get_config_variable('region')
+
+        # Figure out the verify value base on the various
+        # configuration options.
+        if verify is None:
+            verify = self.get_config_variable('ca_bundle')
+
         loader = self.get_component('data_loader')
         event_emitter = self.get_component('event_emitter')
         response_parser_factory = self.get_component(
@@ -755,8 +799,9 @@ class Session(object):
             loader, endpoint_resolver, self.user_agent(), event_emitter,
             retryhandler, translate, response_parser_factory)
         client = client_creator.create_client(
-            service_name, region_name, use_ssl, endpoint_url, verify,
-            credentials, scoped_config=self.get_scoped_config(),
+            service_name=service_name, region_name=region_name,
+            is_secure=use_ssl, endpoint_url=endpoint_url, verify=verify,
+            credentials=credentials, scoped_config=self.get_scoped_config(),
             client_config=config, api_version=api_version)
         return client
 
@@ -769,8 +814,12 @@ class ComponentLocator(object):
 
     def get_component(self, name):
         if name in self._deferred:
-            factory = self._deferred.pop(name)
+            factory = self._deferred[name]
             self._components[name] = factory()
+            # Only delete the component from the deferred dict after
+            # successfully creating the object from the factory as well as
+            # injecting the instantiated value into the _components dict.
+            del self._deferred[name]
         try:
             return self._components[name]
         except KeyError:

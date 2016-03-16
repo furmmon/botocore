@@ -23,7 +23,7 @@ import sys
 from mock import Mock, patch
 
 from botocore.exceptions import UnseekableStreamError
-from botocore.awsrequest import AWSRequest
+from botocore.awsrequest import AWSRequest, AWSPreparedRequest
 from botocore.awsrequest import AWSHTTPConnection
 from botocore.awsrequest import prepare_request_dict, create_request_object
 from botocore.compat import file_type, six
@@ -70,6 +70,31 @@ class Unseekable(file_type):
         # but it doesn't actually work (for example socket.makefile(), which
         # will raise an io.* error on python3).
         raise ValueError("Underlying stream does not support seeking.")
+
+
+class Seekable(object):
+    """This class represents a bare-bones,seekable file-like object
+
+    Note it does not include some of the other attributes of other
+    file-like objects such as StringIO's getvalue() and file object's fileno
+    property. If the file-like object does not have either of these attributes
+    requests will not calculate the content length even though it is still
+    possible to calculate it.
+    """
+    def __init__(self, stream):
+        self._stream = stream
+
+    def __iter__(self):
+        return iter(self._stream)
+
+    def read(self):
+        return self._stream.read()
+
+    def seek(self, offset, whence=0):
+        self._stream.seek(offset, whence)
+
+    def tell(self):
+        return self._stream.tell()
 
 
 class TestAWSRequest(unittest.TestCase):
@@ -147,6 +172,58 @@ class TestAWSRequest(unittest.TestCase):
 
         # The stream should now be reset.
         self.assertTrue(looks_like_file.seek_called)
+
+
+class TestAWSPreparedRequest(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.mkdtemp()
+        self.filename = os.path.join(self.tempdir, 'foo')
+        self.request = AWSRequest(url='http://example.com')
+        self.prepared_request = AWSPreparedRequest(self.request)
+        self.prepared_request.prepare_headers(self.request.headers)
+
+    def tearDown(self):
+        shutil.rmtree(self.tempdir)
+
+    def test_prepare_body_content_adds_content_length(self):
+        content = b'foobarbaz'
+        with open(self.filename, 'wb') as f:
+            f.write(content)
+        with open(self.filename, 'rb') as f:
+            data = Seekable(f)
+            self.prepared_request.prepare_body(data=data, files=None)
+        self.assertEqual(
+            self.prepared_request.headers['Content-Length'],
+            str(len(content)))
+
+    def test_prepare_body_removes_transfer_encoding(self):
+        self.prepared_request.headers['Transfer-Encoding'] = 'chunked'
+        content = b'foobarbaz'
+        with open(self.filename, 'wb') as f:
+            f.write(content)
+        with open(self.filename, 'rb') as f:
+            data = Seekable(f)
+            self.prepared_request.prepare_body(data=data, files=None)
+        self.assertEqual(
+            self.prepared_request.headers['Content-Length'],
+            str(len(content)))
+        self.assertNotIn('Transfer-Encoding', self.prepared_request.headers)
+
+    def test_prepare_body_ignores_existing_transfer_encoding(self):
+        content = b'foobarbaz'
+        self.prepared_request.headers['Transfer-Encoding'] = 'chunked'
+        with open(self.filename, 'wb') as f:
+            f.write(content)
+        with open(self.filename, 'rb') as f:
+            self.prepared_request.prepare_body(data=f, files=None)
+        # The Transfer-Encoding should not be removed if Content-Length
+        # is not added via the custom logic in the ``prepare_body`` method.
+        # Note requests' ``prepare_body`` is the method that adds the
+        # Content-Length header for this case as the ``data`` is a
+        # regular file handle.
+        self.assertEqual(
+            self.prepared_request.headers['Transfer-Encoding'],
+            'chunked')
 
 
 class TestAWSHTTPConnection(unittest.TestCase):
@@ -356,6 +433,46 @@ class TestAWSHTTPConnection(unittest.TestCase):
                      headers={"Utf8-Header": b"\xe5\xb0\x8f"})
         response = conn.getresponse()
         self.assertEqual(response.status, 200)
+
+    def test_state_reset_on_connection_close(self):
+        # This simulates what urllib3 does with connections
+        # in its connection pool logic.
+        with patch('select.select') as select_mock:
+
+            # First fast fail with a 500 response when we first
+            # send the expect header.
+            s = FakeSocket(b'HTTP/1.1 500 Internal Server Error\r\n')
+            conn = AWSHTTPConnection('s3.amazonaws.com', 443)
+            conn.sock = s
+            select_mock.return_value = ([s], [], [])
+
+            conn.request('GET', '/bucket/foo', b'body',
+                        {'Expect': '100-continue'})
+            response = conn.getresponse()
+            self.assertEqual(response.status, 500)
+
+            # Now what happens in urllib3 is that when the next
+            # request comes along and this conection gets checked
+            # out.  We see that the connection needs to be
+            # reset.  So first the connection is closed.
+            conn.close()
+
+            # And then a new connection is established.
+            new_conn = FakeSocket(
+                b'HTTP/1.1 100 (Continue)\r\n\r\nHTTP/1.1 200 OK\r\n')
+            conn.sock = new_conn
+
+            # And we make a request, we should see the 200 response
+            # that was sent back.
+            select_mock.return_value = ([new_conn], [], [])
+
+            conn.request('GET', '/bucket/foo', b'body',
+                        {'Expect': '100-continue'})
+            response = conn.getresponse()
+            # This should be 200.  If it's a 500 then
+            # the prior response was leaking into our
+            # current response.,
+            self.assertEqual(response.status, 200)
 
 
 class TestPrepareRequestDict(unittest.TestCase):

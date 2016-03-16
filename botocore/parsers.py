@@ -293,6 +293,15 @@ class BaseXMLResponseParser(ResponseParser):
             if member_node is not None:
                 parsed[member_name] = self._parse_shape(
                     member_shape, member_node)
+            elif member_shape.serialization.get('xmlAttribute'):
+                attribs = {}
+                location_name = member_shape.serialization['name']
+                for key, value in node.attrib.items():
+                    new_key = self._namespace_re.sub(
+                        location_name.split(':')[0] + ':', key)
+                    attribs[new_key] = value
+                if location_name in attribs:
+                    parsed[member_name] = attribs[location_name]
         return parsed
 
     def _member_key_name(self, shape, member_name):
@@ -311,6 +320,11 @@ class BaseXMLResponseParser(ResponseParser):
         return member_name
 
     def _build_name_to_xml_node(self, parent_node):
+        # If the parent node is actually a list. We should not be trying
+        # to serialize it to a dictionary. Instead, return the first element
+        # in the list.
+        if isinstance(parent_node, list):
+            return self._build_name_to_xml_node(parent_node[0])
         xml_dict = {}
         for item in parent_node:
             key = self._node_tag(item)
@@ -460,6 +474,11 @@ class BaseJSONParser(ResponseParser):
 
     def _handle_structure(self, shape, value):
         member_shapes = shape.members
+        if value is None:
+            # If the comes across the wire as "null" (None in python),
+            # we should be returning this unchanged, instead of as an
+            # empty dict.
+            return None
         final_parsed = {}
         for member_name in member_shapes:
             member_shape = member_shapes[member_name]
@@ -486,21 +505,6 @@ class BaseJSONParser(ResponseParser):
 
     def _handle_timestamp(self, shape, value):
         return self._timestamp_parser(value)
-
-
-class JSONParser(BaseJSONParser):
-    """Response parse for the "json" protocol."""
-    def _do_parse(self, response, shape):
-        # The json.loads() gives us the primitive JSON types,
-        # but we need to traverse the parsed JSON data to convert
-        # to richer types (blobs, timestamps, etc.
-        parsed = {}
-        if shape is not None:
-            body = response['body'].decode(self.DEFAULT_ENCODING)
-            original_parsed = json.loads(body)
-            parsed = self._parse_shape(shape, original_parsed)
-        self._inject_response_metadata(parsed, response['headers'])
-        return parsed
 
     def _do_error_parse(self, response, shape):
         body = json.loads(response['body'].decode(self.DEFAULT_ENCODING))
@@ -530,6 +534,21 @@ class JSONParser(BaseJSONParser):
         if 'x-amzn-requestid' in headers:
             parsed.setdefault('ResponseMetadata', {})['RequestId'] = (
                 headers['x-amzn-requestid'])
+
+
+class JSONParser(BaseJSONParser):
+    """Response parse for the "json" protocol."""
+    def _do_parse(self, response, shape):
+        # The json.loads() gives us the primitive JSON types,
+        # but we need to traverse the parsed JSON data to convert
+        # to richer types (blobs, timestamps, etc.
+        parsed = {}
+        if shape is not None:
+            body = response['body'].decode(self.DEFAULT_ENCODING)
+            original_parsed = json.loads(body)
+            parsed = self._parse_shape(shape, original_parsed)
+        self._inject_response_metadata(parsed, response['headers'])
+        return parsed
 
 
 class BaseRestParser(ResponseParser):
@@ -632,7 +651,7 @@ class RestJSONParser(BaseRestParser, BaseJSONParser):
 
     def _do_error_parse(self, response, shape):
         body = self._initial_body_parse(response['body'])
-        error = {'Error': {}, 'ResponseMetadata': {}}
+        error = super(RestJSONParser, self)._do_error_parse(response, shape)
         error['Error']['Message'] = body.get('message',
                                              body.get('Message', ''))
         if 'x-amzn-errortype' in response['headers']:
@@ -669,9 +688,16 @@ class RestXMLParser(BaseRestParser, BaseXMLResponseParser):
         #   <RequestId>request-id</RequestId>
         # </ErrorResponse>
         if response['body']:
-            return self._parse_error_from_body(response)
-        else:
-            return self._parse_error_from_http_status(response)
+            # If the body ends up being invalid xml, the xml parser should not
+            # blow up. It should at least try to pull information about the
+            # the error response from other sources like the HTTP status code.
+            try:
+                return self._parse_error_from_body(response)
+            except ResponseParserError as e:
+                LOG.debug(
+                    'Exception caught when parsing error response body:',
+                    exc_info=True)
+        return self._parse_error_from_http_status(response)
 
     def _parse_error_from_http_status(self, response):
         return {

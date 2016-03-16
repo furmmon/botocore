@@ -40,6 +40,7 @@ class BaseSessionTest(unittest.TestCase):
             'data_path': ('data_path', 'FOO_DATA_PATH', None, None),
             'config_file': (None, 'FOO_CONFIG_FILE', None, None),
             'credentials_file': (None, None, '/tmp/nowhere', None),
+            'ca_bundle': ('foo_ca_bundle', 'FOO_AWS_CA_BUNDLE', None, None),
         }
         self.environ = {}
         self.environ_patch = mock.patch('os.environ', self.environ)
@@ -414,13 +415,48 @@ class TestCreateClient(BaseSessionTest):
 
     @mock.patch('botocore.client.ClientCreator')
     def test_config_passed_to_client_creator(self, client_creator):
-        config = client.Config()
-        self.session.create_client('sts', config=config)
+        # Make sure there is no default set
+        self.assertEqual(self.session.get_default_client_config(), None)
 
+        # The config passed to the client should be the one that is used
+        # in creating the client.
+        config = client.Config(region_name='us-west-2')
+        self.session.create_client('sts', config=config)
         client_creator.return_value.create_client.assert_called_with(
-            mock.ANY, mock.ANY, mock.ANY, mock.ANY, mock.ANY, mock.ANY,
+            service_name=mock.ANY, region_name=mock.ANY, is_secure=mock.ANY,
+            endpoint_url=mock.ANY, verify=mock.ANY, credentials=mock.ANY,
             scoped_config=mock.ANY, client_config=config,
             api_version=mock.ANY)
+
+    @mock.patch('botocore.client.ClientCreator')
+    def test_create_client_with_default_client_config(self, client_creator):
+        config = client.Config()
+        self.session.set_default_client_config(config)
+        self.session.create_client('sts')
+
+        client_creator.return_value.create_client.assert_called_with(
+            service_name=mock.ANY, region_name=mock.ANY, is_secure=mock.ANY,
+            endpoint_url=mock.ANY, verify=mock.ANY, credentials=mock.ANY,
+            scoped_config=mock.ANY, client_config=config,
+            api_version=mock.ANY)
+
+    @mock.patch('botocore.client.ClientCreator')
+    def test_create_client_with_merging_client_configs(self, client_creator):
+        config = client.Config(region_name='us-west-2')
+        other_config = client.Config(region_name='us-east-1')
+        self.session.set_default_client_config(config)
+        self.session.create_client('sts', config=other_config)
+
+        # Grab the client config used in creating the client
+        used_client_config = (
+            client_creator.return_value.create_client.call_args[1][
+                'client_config'])
+        # Check that the client configs were merged
+        self.assertEqual(used_client_config.region_name, 'us-east-1')
+        # Make sure that the client config used is not the default client
+        # config or the one passed in. It should be a new config.
+        self.assertIsNot(used_client_config, config)
+        self.assertIsNot(used_client_config, other_config)
 
     def test_create_client_with_region(self):
         ec2_client = self.session.create_client(
@@ -448,6 +484,124 @@ class TestCreateClient(BaseSessionTest):
         ec2_client = self.session.create_client('ec2')
         self.assertEqual(ec2_client.meta.region_name, 'moon-west-1')
 
+    @mock.patch('botocore.client.ClientCreator')
+    def test_create_client_with_ca_bundle_from_config(self, client_creator):
+        with temporary_file('w') as f:
+            del self.environ['FOO_PROFILE']
+            self.environ['FOO_CONFIG_FILE'] = f.name
+            self.session = create_session(session_vars=self.env_vars)
+            f.write('[default]\n')
+            f.write('foo_ca_bundle=config-certs.pem\n')
+            f.flush()
 
-if __name__ == "__main__":
-    unittest.main()
+            self.session.create_client('ec2', 'us-west-2')
+            call_kwargs = client_creator.return_value.\
+                create_client.call_args[1]
+            self.assertEqual(call_kwargs['verify'], 'config-certs.pem')
+
+    @mock.patch('botocore.client.ClientCreator')
+    def test_create_client_with_ca_bundle_from_env_var(self, client_creator):
+        self.environ['FOO_AWS_CA_BUNDLE'] = 'env-certs.pem'
+        self.session.create_client('ec2', 'us-west-2')
+        call_kwargs = client_creator.return_value.create_client.call_args[1]
+        self.assertEqual(call_kwargs['verify'], 'env-certs.pem')
+
+    @mock.patch('botocore.client.ClientCreator')
+    def test_create_client_with_verify_param(self, client_creator):
+        self.session.create_client(
+            'ec2', 'us-west-2', verify='verify-certs.pem')
+        call_kwargs = client_creator.return_value.create_client.call_args[1]
+        self.assertEqual(call_kwargs['verify'], 'verify-certs.pem')
+
+    @mock.patch('botocore.client.ClientCreator')
+    def test_create_client_verify_param_overrides_all(self, client_creator):
+        with temporary_file('w') as f:
+            # Set the ca cert using the config file
+            del self.environ['FOO_PROFILE']
+            self.environ['FOO_CONFIG_FILE'] = f.name
+            self.session = create_session(session_vars=self.env_vars)
+            f.write('[default]\n')
+            f.write('foo_ca_bundle=config-certs.pem\n')
+            f.flush()
+
+            # Set the ca cert with an environment variable
+            self.environ['FOO_AWS_CA_BUNDLE'] = 'env-certs.pem'
+
+            # Set the ca cert using the verify parameter
+            self.session.create_client(
+                'ec2', 'us-west-2', verify='verify-certs.pem')
+            call_kwargs = client_creator.return_value.\
+                create_client.call_args[1]
+            # The verify parameter should override all the other
+            # configurations
+            self.assertEqual(call_kwargs['verify'], 'verify-certs.pem')
+
+
+class TestComponentLocator(unittest.TestCase):
+    def setUp(self):
+        self.components = botocore.session.ComponentLocator()
+
+    def test_unknown_component_raises_exception(self):
+        with self.assertRaises(ValueError):
+            self.components.get_component('unknown-component')
+
+    def test_can_register_and_retrieve_component(self):
+        component = object()
+        self.components.register_component('foo', component)
+        self.assertIs(self.components.get_component('foo'), component)
+
+    def test_last_registration_wins(self):
+        first = object()
+        second = object()
+        self.components.register_component('foo', first)
+        self.components.register_component('foo', second)
+        self.assertIs(self.components.get_component('foo'), second)
+
+    def test_can_lazy_register_a_component(self):
+        component = object()
+        lazy = lambda: component
+        self.components.lazy_register_component('foo', lazy)
+        self.assertIs(self.components.get_component('foo'), component)
+
+    def test_latest_registration_wins_even_if_lazy(self):
+        first = object()
+        second = object()
+        lazy_second = lambda: second
+        self.components.register_component('foo', first)
+        self.components.lazy_register_component('foo', lazy_second)
+        self.assertIs(self.components.get_component('foo'), second)
+
+    def test_latest_registration_overrides_lazy(self):
+        first = object()
+        second = object()
+        lazy_first = lambda: first
+        self.components.lazy_register_component('foo', lazy_first)
+        self.components.register_component('foo', second)
+        self.assertIs(self.components.get_component('foo'), second)
+
+    def test_lazy_registration_factory_does_not_remove_from_list_on_error(self):
+        class ArbitraryError(Exception):
+            pass
+
+        def bad_factory():
+            raise ArbitraryError("Factory raises an exception.")
+
+        self.components.lazy_register_component('foo', bad_factory)
+
+        with self.assertRaises(ArbitraryError):
+            self.components.get_component('foo')
+
+        # Trying again should raise the same exception,
+        # not an ValueError("Unknown component")
+        with self.assertRaises(ArbitraryError):
+            self.components.get_component('foo')
+
+
+class TestDefaultClientConfig(BaseSessionTest):
+    def test_new_session_has_no_default_client_config(self):
+        self.assertEqual(self.session.get_default_client_config(), None)
+
+    def test_set_and_get_client_config(self):
+        client_config = client.Config()
+        self.session.set_default_client_config(client_config)
+        self.assertIs(self.session.get_default_client_config(), client_config)

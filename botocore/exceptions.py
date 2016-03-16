@@ -11,6 +11,7 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
+from botocore.vendored.requests.exceptions import ConnectionError
 
 
 class BotoCoreError(Exception):
@@ -19,12 +20,23 @@ class BotoCoreError(Exception):
 
     :ivar msg: The descriptive message associated with the error.
     """
-    fmt = 'An unspecified error occured'
+    fmt = 'An unspecified error occurred'
 
     def __init__(self, **kwargs):
         msg = self.fmt.format(**kwargs)
         Exception.__init__(self, msg)
         self.kwargs = kwargs
+
+
+class UnknownServiceError(BotoCoreError):
+    """Raised when trying to load data for an unknown service.
+
+    :ivar service_name: The name of the unknown service.
+
+    """
+    fmt = (
+        "Unknown service: '{service_name}'. Valid service names are: "
+        "{known_service_names}")
 
 
 class DataNotFoundError(BotoCoreError):
@@ -50,6 +62,16 @@ class ApiVersionNotFoundError(BotoCoreError):
 class EndpointConnectionError(BotoCoreError):
     fmt = (
         'Could not connect to the endpoint URL: "{endpoint_url}"')
+
+
+class ConnectionClosedError(ConnectionError):
+    fmt = (
+        'Connection was closed before we received a valid response '
+        'from endpoint URL: "{endpoint_url}".')
+    def __init__(self, **kwargs):
+        msg = self.fmt.format(**kwargs)
+        kwargs.pop('endpoint_url')
+        super(ConnectionClosedError, self).__init__(msg, **kwargs)
 
 
 class NoCredentialsError(BotoCoreError):
@@ -296,12 +318,48 @@ class ClientError(Exception):
 
     def __init__(self, error_response, operation_name):
         msg = self.MSG_TEMPLATE.format(
-            error_code=error_response['Error']['Code'],
-            error_message=error_response['Error']['Message'],
+            error_code=error_response['Error'].get('Code', 'Unknown'),
+            error_message=error_response['Error'].get('Message', 'Unknown'),
             operation_name=operation_name)
         super(ClientError, self).__init__(msg)
         self.response = error_response
 
 
+class UnsupportedTLSVersionWarning(Warning):
+    """Warn when an openssl version that uses TLS 1.2 is required"""
+    pass
+
+
 class ImminentRemovalWarning(Warning):
     pass
+
+
+class InvalidDNSNameError(BotoCoreError):
+    """Error when virtual host path is forced on a non-DNS compatible bucket"""
+    fmt = (
+        'Bucket named {bucket_name} is not DNS compatible. Virtual '
+        'hosted-style addressing cannot be used. The addressing style '
+        'can be configured by removing the addressing_style value '
+        'or setting that value to \'path\' or \'auto\' in the AWS Config '
+        'file or in the botocore.client.Config object.'
+    )
+
+
+class InvalidS3AddressingStyleError(BotoCoreError):
+    """Error when an invalid path style is specified"""
+    fmt = (
+        'S3 addressing style {s3_addressing_style} is invaild. Valid options '
+        'are: \'auto\', \'virtual\', and \'path\''
+    )
+
+
+class StubResponseError(BotoCoreError):
+    fmt = 'Error getting response stub for operation {operation_name}: {reason}'
+
+
+class InvalidConfigError(BotoCoreError):
+    fmt = '{error_msg}'
+
+
+class RefreshWithMFAUnsupportedError(BotoCoreError):
+    fmt = 'Cannot refresh credentials: MFA token required.'

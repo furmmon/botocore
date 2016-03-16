@@ -22,6 +22,7 @@ from botocore.endpoint import Endpoint, DEFAULT_TIMEOUT
 from botocore.endpoint import EndpointCreator
 from botocore.endpoint import PreserveAuthSession
 from botocore.exceptions import EndpointConnectionError
+from botocore.exceptions import ConnectionClosedError
 from botocore.exceptions import BaseEndpointResolverError
 
 
@@ -99,12 +100,6 @@ class TestEndpointFeatures(TestEndpointBase):
         self.assertNotIn('Authorization', prepared_request.headers)
 
     def test_make_request_no_signature_version(self):
-        self.endpoint = Endpoint(
-            'https://ec2.us-west-2.amazonaws.com/',
-            endpoint_prefix='ec2',
-            event_emitter=self.event_emitter)
-        self.endpoint.http_session = self.http_session
-
         self.endpoint.make_request(self.op, request_dict())
 
         # http_session should be used to send the request.
@@ -113,15 +108,20 @@ class TestEndpointFeatures(TestEndpointBase):
         self.assertNotIn('Authorization', prepared_request.headers)
 
     def test_make_request_injects_better_dns_error_msg(self):
-        self.endpoint = Endpoint(
-            'https://ec2.us-west-2.amazonaws.com/',
-            endpoint_prefix='ec2', event_emitter=self.event_emitter)
-        self.endpoint.http_session = self.http_session
         fake_request = Mock(url='https://ec2.us-west-2.amazonaws.com')
         self.http_session.send.side_effect = ConnectionError(
             "Fake gaierror(8, node or host not known)", request=fake_request)
         with self.assertRaisesRegexp(EndpointConnectionError,
                                      'Could not connect'):
+            self.endpoint.make_request(self.op, request_dict())
+
+    def test_make_request_injects_better_bad_status_line_error_msg(self):
+        fake_request = Mock(url='https://ec2.us-west-2.amazonaws.com')
+        self.http_session.send.side_effect = ConnectionError(
+            """'Connection aborted.', BadStatusLine("''",)""",
+            request=fake_request)
+        with self.assertRaisesRegexp(ConnectionClosedError,
+                                     'Connection was closed'):
             self.endpoint.make_request(self.op, request_dict())
 
 
@@ -277,6 +277,16 @@ class TestEndpointCreator(unittest.TestCase):
         endpoint = self.creator.create_endpoint(self.service_model,
                                                 endpoint_url='https://foo')
         self.assertEqual(endpoint.host, 'https://foo')
+
+    def test_create_endpoint_with_default_timeout(self):
+        endpoint = self.creator.create_endpoint(
+            self.service_model, 'us-west-2')
+        self.assertEqual(endpoint.timeout, DEFAULT_TIMEOUT)
+
+    def test_create_endpoint_with_customized_timeout(self):
+        endpoint = self.creator.create_endpoint(
+            self.service_model, 'us-west-2', timeout=123)
+        self.assertEqual(endpoint.timeout, 123)
 
     def test_get_endpoint_default_verify_ssl(self):
         endpoint = self.creator.create_endpoint(

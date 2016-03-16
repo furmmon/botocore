@@ -14,6 +14,8 @@ import jmespath
 import logging
 import time
 
+from botocore.utils import get_service_module_name
+from botocore.docs.docstring import WaiterDocstring
 from .exceptions import WaiterError, ClientError, WaiterConfigError
 from . import xform_name
 
@@ -43,7 +45,32 @@ def create_waiter_with_client(waiter_name, waiter_model, client):
     operation_name = xform_name(single_waiter_config.operation)
     operation_method = NormalizedOperationMethod(
         getattr(client, operation_name))
-    return Waiter(
+
+    # Create a new wait method that will serve as a proxy to the underlying
+    # Waiter.wait method. This is needed to attach a docstring to the
+    # method.
+    def wait(self, **kwargs):
+        Waiter.wait(self, **kwargs)
+
+    wait.__doc__ = WaiterDocstring(
+        waiter_name=waiter_name,
+        event_emitter=client.meta.events,
+        service_model=client.meta.service_model,
+        service_waiter_model=waiter_model,
+        include_signature=False
+    )
+
+    # Rename the waiter class based on the type of waiter.
+    waiter_class_name = str('%s.Waiter.%s' % (
+        get_service_module_name(client.meta.service_model),
+        waiter_name))
+
+    # Create the new waiter class
+    documented_waiter_cls = type(
+        waiter_class_name, (Waiter,), {'wait': wait})
+
+    # Return an instance of the new waiter class.
+    return documented_waiter_cls(
         waiter_name, single_waiter_config, operation_method
     )
 
@@ -272,8 +299,9 @@ class Waiter(object):
                 if 'Error' in response:
                     # Transition to the failure state, which we can
                     # just handle here by raising an exception.
-                    raise WaiterError(name=self.name,
-                                      reason='Unexpected error encountered.')
+                    raise WaiterError(
+                        name=self.name,
+                        reason=response['Error'].get('Message', 'Unknown'))
             if current_state == 'success':
                 logger.debug("Waiting complete, waiter matched the "
                              "success state.")

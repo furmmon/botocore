@@ -11,14 +11,18 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 import datetime
+import weakref
+import json
+import base64
 
 import botocore
 import botocore.auth
+from botocore.compat import six, OrderedDict
 from botocore.awsrequest import create_request_object, prepare_request_dict
 from botocore.exceptions import UnknownSignatureVersionError
 from botocore.exceptions import UnknownClientMethodError
 from botocore.exceptions import UnsupportedSignatureVersionError
-from botocore.utils import fix_s3_host
+from botocore.utils import fix_s3_host, datetime2timestamp
 
 
 class RequestSigner(object):
@@ -36,18 +40,24 @@ class RequestSigner(object):
 
     :type service_name: string
     :param service_name: Name of the service, e.g. ``S3``
+
     :type region_name: string
     :param region_name: Name of the service region, e.g. ``us-east-1``
+
     :type signing_name: string
     :param signing_name: Service signing name. This is usually the
                          same as the service name, but can differ. E.g.
                          ``emr`` vs. ``elasticmapreduce``.
+
     :type signature_version: string
     :param signature_version: Signature name like ``v4``.
+
     :type credentials: :py:class:`~botocore.credentials.Credentials`
     :param credentials: User credentials with which to sign requests.
+
     :type event_emitter: :py:class:`~botocore.hooks.BaseEventHooks`
     :param event_emitter: Extension mechanism to fire events.
+
     """
     def __init__(self, service_name, region_name, signing_name,
                  signature_version, credentials, event_emitter):
@@ -56,11 +66,9 @@ class RequestSigner(object):
         self._signing_name = signing_name
         self._signature_version = signature_version
         self._credentials = credentials
-        self._event_emitter = event_emitter
 
-        # Used to cache auth instances since one request signer
-        # can be used for many requests in a single client.
-        self._cache = {}
+        # We need weakref to prevent leaking memory in Python 2.6 on Linux 2.6
+        self._event_emitter = weakref.proxy(event_emitter)
 
     @property
     def region_name(self):
@@ -74,9 +82,15 @@ class RequestSigner(object):
     def signing_name(self):
         return self._signing_name
 
+    def handler(self, operation_name=None, request=None, **kwargs):
+        # This is typically hooked up to the "request-created" event
+        # from a client's event emitter.  When a new request is created
+        # this method is invoked to sign the request.
+        # Don't call this method directly.
+        return self.sign(operation_name, request)
+
     def sign(self, operation_name, request):
-        """
-        Sign a request before it goes out over the wire.
+        """Sign a request before it goes out over the wire.
 
         :type operation_name: string
         :param operation_name: The name of the current operation, e.g.
@@ -103,14 +117,14 @@ class RequestSigner(object):
             region_name=self._region_name,
             signature_version=signature_version, request_signer=self)
 
-        # Sign the request if the signature version isn't None or blank
         if signature_version != botocore.UNSIGNED:
-            signer = self.get_auth(self._signing_name, self._region_name,
-                                    signature_version)
+            signer = self.get_auth_instance(self._signing_name,
+                                            self._region_name,
+                                            signature_version)
             signer.add_auth(request=request)
 
-    def get_auth(self, signing_name, region_name, signature_version=None,
-                 **kwargs):
+    def get_auth_instance(self, signing_name, region_name,
+                          signature_version=None, **kwargs):
         """
         Get an auth instance which can be used to sign a request
         using the given signature version.
@@ -119,35 +133,34 @@ class RequestSigner(object):
         :param signing_name: Service signing name. This is usually the
                              same as the service name, but can differ. E.g.
                              ``emr`` vs. ``elasticmapreduce``.
+
         :type region_name: string
         :param region_name: Name of the service region, e.g. ``us-east-1``
+
         :type signature_version: string
         :param signature_version: Signature name like ``v4``.
+
         :rtype: :py:class:`~botocore.auth.BaseSigner`
         :return: Auth instance to sign a request.
         """
         if signature_version is None:
             signature_version = self._signature_version
 
-        key = '{0}.{1}.{2}'.format(signature_version, region_name,
-                                   signing_name)
-        if key in self._cache:
-            return self._cache[key]
-
         cls = botocore.auth.AUTH_TYPE_MAPS.get(signature_version)
         if cls is None:
             raise UnknownSignatureVersionError(
                 signature_version=signature_version)
-        else:
-            kwargs['credentials'] = self._credentials
-            if cls.REQUIRES_REGION:
-                if self._region_name is None:
-                    raise botocore.exceptions.NoRegionError()
-                kwargs['region_name'] = region_name
-                kwargs['service_name'] = signing_name
-            auth = cls(**kwargs)
-            self._cache[key] = auth
-            return auth
+        kwargs['credentials'] = self._credentials.get_frozen_credentials()
+        if cls.REQUIRES_REGION:
+            if self._region_name is None:
+                raise botocore.exceptions.NoRegionError()
+            kwargs['region_name'] = region_name
+            kwargs['service_name'] = signing_name
+        auth = cls(**kwargs)
+        return auth
+
+    # Alias get_auth for backwards compatibility.
+    get_auth = get_auth_instance
 
     def generate_presigned_url(self, request_dict, expires_in=3600,
                                region_name=None):
@@ -180,7 +193,7 @@ class RequestSigner(object):
 
         signature_type = signature_version.split('-', 1)[0]
         try:
-            auth = self.get_auth(**kwargs)
+            auth = self.get_auth_instance(**kwargs)
         except UnknownSignatureVersionError:
             raise UnsupportedSignatureVersionError(
                 signature_version=signature_type)
@@ -194,6 +207,132 @@ class RequestSigner(object):
         request.prepare()
 
         return request.url
+
+
+class CloudFrontSigner(object):
+    '''A signer to create a signed CloudFront URL.
+
+    First you create a cloudfront signer based on a normalized RSA signer::
+
+        import rsa
+        def rsa_signer(message):
+            private_key = open('private_key.pem', 'r').read()
+            return rsa.sign(
+                message,
+                rsa.PrivateKey.load_pkcs1(private_key.encode('utf8')),
+                'SHA-1')  # CloudFront requires SHA-1 hash
+        cf_signer = CloudFrontSigner(key_id, rsa_signer)
+
+    To sign with a canned policy::
+
+        signed_url = cf_signer.generate_signed_url(
+            url, date_less_than=datetime(2015, 12, 1))
+
+    To sign with a custom policy::
+
+        signed_url = cf_signer.generate_signed_url(url, policy=my_policy)
+    '''
+
+    def __init__(self, key_id, rsa_signer):
+        """Create a CloudFrontSigner.
+
+        :type key_id: str
+        :param key_id: The CloudFront Key Pair ID
+
+        :type rsa_signer: callable
+        :param rsa_signer: An RSA signer.
+               Its only input parameter will be the message to be signed,
+               and its output will be the signed content as a binary string.
+               The hash algorithm needed by CloudFront is SHA-1.
+        """
+        self.key_id = key_id
+        self.rsa_signer = rsa_signer
+
+    def generate_presigned_url(self, url, date_less_than=None, policy=None):
+        """Creates a signed CloudFront URL based on given parameters.
+
+        :type url: str
+        :param url: The URL of the protected object
+
+        :type date_less_than: datetime
+        :param date_less_than: The URL will expire after that date and time
+
+        :type policy: str
+        :param policy: The custom policy, possibly built by self.build_policy()
+
+        :rtype: str
+        :return: The signed URL.
+        """
+        if (date_less_than is not None and policy is not None
+                or date_less_than is None and policy is None):
+            e = 'Need to provide either date_less_than or policy, but not both'
+            raise ValueError(e)
+        if date_less_than is not None:
+            # We still need to build a canned policy for signing purpose
+            policy = self.build_policy(url, date_less_than)
+        if isinstance(policy, six.text_type):
+            policy = policy.encode('utf8')
+        if date_less_than is not None:
+            params = ['Expires=%s' % int(datetime2timestamp(date_less_than))]
+        else:
+            params = ['Policy=%s' % self._url_b64encode(policy).decode('utf8')]
+        signature = self.rsa_signer(policy)
+        params.extend([
+            'Signature=%s' % self._url_b64encode(signature).decode('utf8'),
+            'Key-Pair-Id=%s' % self.key_id,
+            ])
+        return self._build_url(url, params)
+
+    def _build_url(self, base_url, extra_params):
+        separator = '&' if '?' in base_url else '?'
+        return base_url + separator + '&'.join(extra_params)
+
+    def build_policy(self, resource, date_less_than,
+                     date_greater_than=None, ip_address=None):
+        """A helper to build policy.
+
+        :type resource: str
+        :param resource: The URL or the stream filename of the protected object
+
+        :type date_less_than: datetime
+        :param date_less_than: The URL will expire after the time has passed
+
+        :type date_greater_than: datetime
+        :param date_greater_than: The URL will not be valid until this time
+
+        :type ip_address: str
+        :param ip_address: Use 'x.x.x.x' for an IP, or 'x.x.x.x/x' for a subnet
+
+        :rtype: str
+        :return: The policy in a compact string.
+        """
+        # Note:
+        # 1. Order in canned policy is significant. Special care has been taken
+        #    to ensure the output will match the order defined by the document.
+        #    There is also a test case to ensure that order.
+        #    SEE: http://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-creating-signed-url-canned-policy.html#private-content-canned-policy-creating-policy-statement
+        # 2. Albeit the order in custom policy is not required by CloudFront,
+        #    we still use OrderedDict internally to ensure the result is stable
+        #    and also matches canned policy requirement.
+        #    SEE: http://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-creating-signed-url-custom-policy.html
+        moment = int(datetime2timestamp(date_less_than))
+        condition = OrderedDict({"DateLessThan": {"AWS:EpochTime": moment}})
+        if ip_address:
+            if '/' not in ip_address:
+                ip_address += '/32'
+            condition["IpAddress"] = {"AWS:SourceIp": ip_address}
+        if date_greater_than:
+            moment = int(datetime2timestamp(date_greater_than))
+            condition["DateGreaterThan"] = {"AWS:EpochTime": moment}
+        ordered_payload = [('Resource', resource), ('Condition', condition)]
+        custom_policy = {"Statement": [OrderedDict(ordered_payload)]}
+        return json.dumps(custom_policy, separators=(',', ':'))
+
+    def _url_b64encode(self, data):
+        # Required by CloudFront. See also:
+        # http://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-linux-openssl.html
+        return base64.b64encode(
+            data).replace(b'+', b'-').replace(b'=', b'_').replace(b'/', b'~')
 
 
 class S3PostPresigner(object):
@@ -277,7 +416,7 @@ class S3PostPresigner(object):
         signature_type = signature_version.split('-', 1)[0]
 
         try:
-            auth = self._request_signer.get_auth(**kwargs)
+            auth = self._request_signer.get_auth_instance(**kwargs)
         except UnknownSignatureVersionError:
             raise UnsupportedSignatureVersionError(
                 signature_version=signature_type)
@@ -311,7 +450,7 @@ def generate_presigned_url(self, ClientMethod, Params=None, ExpiresIn=3600,
         ``ClientMethod``.
 
     :type ExpiresIn: int
-    :param expires_in: The number of seconds the presigned url is valid
+    :param ExpiresIn: The number of seconds the presigned url is valid
         for. By default it expires in an hour (3600 seconds)
 
     :type HttpMethod: string

@@ -10,7 +10,6 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
-import botocore.session
 from botocore.exceptions import DataNotFoundError
 from botocore.docs.utils import get_official_service_name
 from botocore.docs.client import ClientDocumenter
@@ -20,8 +19,8 @@ from botocore.docs.bcdoc.restdoc import DocumentStructure
 
 
 class ServiceDocumenter(object):
-    def __init__(self, service_name):
-        self._session = botocore.session.get_session()
+    def __init__(self, service_name, session):
+        self._session = session
         self._service_name = service_name
 
         self._client = self._session.create_client(
@@ -57,7 +56,13 @@ class ServiceDocumenter(object):
         section.style.table_of_contents(title='Table of Contents', depth=2)
 
     def client_api(self, section):
-        ClientDocumenter(self._client).document_client(section)
+        examples = None
+        try:
+            examples = self.get_examples(self._service_name)
+        except DataNotFoundError:
+            pass
+
+        ClientDocumenter(self._client, examples).document_client(section)
 
     def paginator_api(self, section):
         try:
@@ -76,3 +81,9 @@ class ServiceDocumenter(object):
             waiter_documenter = WaiterDocumenter(
                 self._client, service_waiter_model)
             waiter_documenter.document_waiters(section)
+
+    def get_examples(self, service_name, api_version=None):
+        loader = self._session.get_component('data_loader')
+        examples = loader.load_service_model(
+            service_name, 'examples-1', api_version)
+        return examples['examples']

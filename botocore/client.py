@@ -10,7 +10,6 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
-import re
 import copy
 import logging
 
@@ -20,14 +19,21 @@ import botocore.serialize
 import botocore.validate
 from botocore import waiter, xform_name
 from botocore.awsrequest import prepare_request_dict
-from botocore.endpoint import EndpointCreator
+from botocore.compat import OrderedDict
+from botocore.endpoint import EndpointCreator, DEFAULT_TIMEOUT
 from botocore.exceptions import ClientError, DataNotFoundError
 from botocore.exceptions import OperationNotPageableError
+from botocore.exceptions import InvalidS3AddressingStyleError
 from botocore.hooks import first_non_none_response
 from botocore.model import ServiceModel
 from botocore.paginate import Paginator
 from botocore.signers import RequestSigner
 from botocore.utils import CachedProperty
+from botocore.utils import get_service_module_name
+from botocore.utils import fix_s3_host
+from botocore.utils import switch_to_virtual_host_style
+from botocore.docs.docstring import ClientMethodDocstring
+from botocore.docs.docstring import PaginatorDocstring
 
 
 logger = logging.getLogger(__name__)
@@ -70,7 +76,7 @@ class ClientCreator(object):
         self._event_emitter.emit('creating-client-class.%s' % service_name,
                                  class_attributes=class_attributes,
                                  base_classes=bases)
-        class_name = self._get_client_class_name(service_model, service_name)
+        class_name = get_service_module_name(service_model)
         cls = type(str(class_name), tuple(bases), class_attributes)
         return cls
 
@@ -80,15 +86,6 @@ class ClientCreator(object):
         service_model = ServiceModel(json_model, service_name=service_name)
         self._register_retries(service_model)
         return service_model
-
-    def _get_client_class_name(self, service_model, service_name):
-        name = service_model.metadata.get(
-            'serviceAbbreviation',
-            service_model.metadata.get('serviceFullName', service_name))
-        name = name.replace('Amazon', '')
-        name = name.replace('AWS', '')
-        name = re.sub('\W+', '', name)
-        return name
 
     def _register_retries(self, service_model):
         endpoint_prefix = service_model.endpoint_prefix
@@ -172,6 +169,30 @@ class ClientCreator(object):
 
         return region_name
 
+    def _inject_s3_configuration(self, config_kwargs, scoped_config,
+                                 client_config):
+        s3_configuration = None
+
+        # Check the scoped config first
+        if scoped_config is not None:
+            s3_configuration = scoped_config.get('s3')
+
+        # Next specfic client config values takes precedence over
+        # specific values in the scoped config.
+        if client_config is not None:
+            if client_config.s3 is not None:
+                if s3_configuration is None:
+                    s3_configuration = client_config.s3
+                else:
+                    # The current s3_configuration dictionary may be
+                    # from a source that only should be read from so
+                    # we want to be safe and just make a copy of it to modify
+                    # before it actually gets updated.
+                    s3_configuration = s3_configuration.copy()
+                    s3_configuration.update(client_config.s3)
+
+        config_kwargs['s3'] = s3_configuration
+
     def _get_client_args(self, service_model, region_name, is_secure,
                          endpoint_url, verify, credentials,
                          scoped_config, client_config):
@@ -181,13 +202,6 @@ class ClientCreator(object):
             protocol, include_validation=True)
 
         event_emitter = copy.copy(self._event_emitter)
-
-        endpoint_creator = EndpointCreator(self._endpoint_resolver,
-                                           region_name, event_emitter)
-        endpoint = endpoint_creator.create_endpoint(
-            service_model, region_name, is_secure=is_secure,
-            endpoint_url=endpoint_url, verify=verify,
-            response_parser_factory=self._response_parser_factory)
 
         response_parser = botocore.parsers.create_parser(protocol)
 
@@ -226,9 +240,27 @@ class ClientCreator(object):
         # Create a new client config to be passed to the client based
         # on the final values. We do not want the user to be able
         # to try to modify an existing client with a client config.
-        client_config = Config(
+        config_kwargs = dict(
             region_name=region_name, signature_version=signature_version,
             user_agent=user_agent)
+        if client_config is not None:
+            config_kwargs.update(
+                connect_timeout=client_config.connect_timeout,
+                read_timeout=client_config.read_timeout)
+
+        # Add any additional s3 configuration for client
+        self._inject_s3_configuration(
+            config_kwargs, scoped_config, client_config)
+
+        new_config = Config(**config_kwargs)
+
+        endpoint_creator = EndpointCreator(self._endpoint_resolver,
+                                           region_name, event_emitter)
+        endpoint = endpoint_creator.create_endpoint(
+            service_model, region_name, is_secure=is_secure,
+            endpoint_url=endpoint_url, verify=verify,
+            response_parser_factory=self._response_parser_factory,
+            timeout=(new_config.connect_timeout, new_config.read_timeout))
 
         return {
             'serializer': serializer,
@@ -238,7 +270,7 @@ class ClientCreator(object):
             'request_signer': signer,
             'service_model': service_model,
             'loader': self._loader,
-            'client_config': client_config
+            'client_config': new_config
         }
 
     def _create_methods(self, service_model):
@@ -271,7 +303,18 @@ class ClientCreator(object):
             return self._make_api_call(operation_name, kwargs)
 
         _api_call.__name__ = str(py_operation_name)
-        # TODO: docstrings.
+
+        # Add the docstring to the client method
+        operation_model = service_model.operation_model(operation_name)
+        docstring = ClientMethodDocstring(
+            operation_model=operation_model,
+            method_name=operation_name,
+            event_emitter=self._event_emitter,
+            method_description=operation_model.documentation,
+            example_prefix='response = client.%s' % py_operation_name,
+            include_signature=False
+        )
+        _api_call.__doc__ = docstring
         return _api_call
 
 
@@ -298,9 +341,29 @@ class BaseClient(object):
         self.meta = ClientMeta(event_emitter, self._client_config,
                                endpoint.host, service_model,
                                self._PY_TO_OP_NAME)
+        self._register_handlers()
+
+    def _register_handlers(self):
+        # Register the handler required to sign requests.
         self.meta.events.register('request-created.%s' %
-                                  service_model.endpoint_prefix,
-                                  self._sign_request)
+                                  self.meta.service_model.endpoint_prefix,
+                                  self._request_signer.handler)
+
+        # If the virtual host addressing style is being forced,
+        # switch the default fix_s3_host handler for the more general
+        # switch_to_virtual_host_style handler that does not have opt out
+        # cases (other than throwing an error if the name is DNS incompatible)
+        if self.meta.config.s3 is None:
+            s3_addressing_style = None
+        else:
+            s3_addressing_style = self.meta.config.s3.get('addressing_style')
+
+        if s3_addressing_style == 'path':
+            self.meta.events.unregister('before-sign.s3', fix_s3_host)
+        elif s3_addressing_style == 'virtual':
+            self.meta.events.unregister('before-sign.s3', fix_s3_host)
+            self.meta.events.register(
+                'before-sign.s3', switch_to_virtual_host_style)
 
     @property
     def _service_model(self):
@@ -308,18 +371,30 @@ class BaseClient(object):
 
     def _make_api_call(self, operation_name, api_params):
         statsd.increment('boto.request', tags=["action:%s" % operation_name])
+        request_context = {}
         operation_model = self._service_model.operation_model(operation_name)
         request_dict = self._convert_to_request_dict(
-            api_params, operation_model)
-        http, parsed_response = self._endpoint.make_request(
-            operation_model, request_dict)
+            api_params, operation_model, context=request_context)
+
+        handler, event_response = self.meta.events.emit_until_response(
+            'before-call.{endpoint_prefix}.{operation_name}'.format(
+                endpoint_prefix=self._service_model.endpoint_prefix,
+                operation_name=operation_name),
+            model=operation_model, params=request_dict,
+            request_signer=self._request_signer, context=request_context)
+
+        if event_response is not None:
+            http, parsed_response = event_response
+        else:
+            http, parsed_response = self._endpoint.make_request(
+                operation_model, request_dict)
 
         self.meta.events.emit(
             'after-call.{endpoint_prefix}.{operation_name}'.format(
                 endpoint_prefix=self._service_model.endpoint_prefix,
                 operation_name=operation_name),
             http_response=http, parsed=parsed_response,
-            model=operation_model
+            model=operation_model, context=request_context
         )
 
         if http.status_code >= 300:
@@ -327,7 +402,8 @@ class BaseClient(object):
         else:
             return parsed_response
 
-    def _convert_to_request_dict(self, api_params, operation_model):
+    def _convert_to_request_dict(self, api_params, operation_model,
+                                 context=None):
         # Given the API params provided by the user and the operation_model
         # we can serialize the request to a request_dict.
         operation_name = operation_model.name
@@ -339,7 +415,7 @@ class BaseClient(object):
             'provide-client-params.{endpoint_prefix}.{operation_name}'.format(
                 endpoint_prefix=self._service_model.endpoint_prefix,
                 operation_name=operation_name),
-            params=api_params, model=operation_model)
+            params=api_params, model=operation_model, context=context)
         api_params = first_non_none_response(responses, default=api_params)
 
         event_name = (
@@ -348,25 +424,13 @@ class BaseClient(object):
             event_name.format(
                 endpoint_prefix=self._service_model.endpoint_prefix,
                 operation_name=operation_name),
-            params=api_params, model=operation_model)
+            params=api_params, model=operation_model, context=context)
 
         request_dict = self._serializer.serialize_to_request(
             api_params, operation_model)
         prepare_request_dict(request_dict, endpoint_url=self._endpoint.host,
                              user_agent=self._client_config.user_agent)
-        self.meta.events.emit(
-            'before-call.{endpoint_prefix}.{operation_name}'.format(
-                endpoint_prefix=self._service_model.endpoint_prefix,
-                operation_name=operation_name),
-            model=operation_model, params=request_dict,
-            request_signer=self._request_signer
-        )
         return request_dict
-
-    def _sign_request(self, operation_name=None, request=None, **kwargs):
-        # Sign the request. This fires its own events and will
-        # mutate the request as needed.
-        self._request_signer.sign(operation_name, request)
 
     def get_paginator(self, operation_name):
         """Create a paginator for an operation.
@@ -391,9 +455,36 @@ class BaseClient(object):
             raise OperationNotPageableError(operation_name=operation_name)
         else:
             actual_operation_name = self._PY_TO_OP_NAME[operation_name]
-            paginator = Paginator(
+
+            # Create a new paginate method that will serve as a proxy to
+            # the underlying Paginator.paginate method. This is needed to
+            # attach a docstring to the method.
+            def paginate(self, **kwargs):
+                return Paginator.paginate(self, **kwargs)
+
+            paginator_config = self._cache['page_config'][
+                actual_operation_name]
+            # Add the docstring for the paginate method.
+            paginate.__doc__ = PaginatorDocstring(
+                paginator_name=actual_operation_name,
+                event_emitter=self.meta.events,
+                service_model=self.meta.service_model,
+                paginator_config=paginator_config,
+                include_signature=False
+            )
+
+            # Rename the paginator class based on the type of paginator.
+            paginator_class_name = str('%s.Paginator.%s' % (
+                get_service_module_name(self.meta.service_model),
+                actual_operation_name))
+
+            # Create the new paginator class
+            documented_paginator_cls = type(
+                paginator_class_name, (Paginator,), {'paginate': paginate})
+
+            paginator = documented_paginator_cls(
                 getattr(self, operation_name),
-                self._cache['page_config'][actual_operation_name])
+                paginator_config)
             return paginator
 
     def can_paginate(self, operation_name):
@@ -506,17 +597,130 @@ class ClientMeta(object):
 class Config(object):
     """Advanced configuration for Botocore clients.
 
-    This class allows you to configure:
+    :type region_name: str
+    :param region_name: The region to use in instantiating the client
 
-        * Region name
-        * Signature version
-        * User agent
-        * User agent extra
+    :type signature_version: str
+    :param signature_version: The signature version when signing requests.
 
+    :type user_agent: str
+    :param user_agent: The value to use in the User-Agent header.
+
+    :type user_agent_extra: str
+    :param user_agent_extra: The value to append to the current User-Agent
+        header value.
+
+    :type connect_timeout: int
+    :param connect_timeout: The time in seconds till a timeout exception is
+        thrown when attempting to make a connection. The default is 60
+        seconds.
+
+    :type read_timeout: int
+    :param read_timeout: The time in seconds till a timeout exception is
+        thrown when attempting to read from a connection. The default is
+        60 seconds.
+
+    :type s3: dict
+    :param s3: A dictionary of s3 specific configurations.
+        Valid keys are:
+            * 'addressing_style' -- Refers to the style in which to address
+              s3 endpoints. Values must be a string that equals:
+                  * auto -- Addressing style is chosen for user. Depending
+                            on the configuration of client, the endpoint
+                            may be addressed in the virtual or the path
+                            style. Note that this is the default behavior if
+                            no style is specified.
+                  * virtual -- Addressing style is always virtual. The name of
+                               the bucket must be DNS compatible or an
+                               exception will be thrown. Endpoints will be
+                               addressed as such: mybucket.s3.amazonaws.com
+                  * path -- Addressing style is always by path. Endpoints will
+                            be addressed as such: s3.amazonaws.com/mybucket
     """
-    def __init__(self, region_name=None, signature_version=None,
-                 user_agent=None, user_agent_extra=None):
-        self.region_name = region_name
-        self.signature_version = signature_version
-        self.user_agent = user_agent
-        self.user_agent_extra = user_agent_extra
+    OPTION_DEFAULTS = OrderedDict([
+        ('region_name', None),
+        ('signature_version', None),
+        ('user_agent', None),
+        ('user_agent_extra', None),
+        ('connect_timeout', DEFAULT_TIMEOUT),
+        ('read_timeout', DEFAULT_TIMEOUT),
+        ('s3', None)
+    ])
+
+    def __init__(self, *args, **kwargs):
+        self._user_provided_options = self._record_user_provided_options(
+            args, kwargs)
+
+        # Merge the user_provided options onto the default options
+        config_vars = copy.copy(self.OPTION_DEFAULTS)
+        config_vars.update(self._user_provided_options)
+
+        # Set the attributes based on the config_vars
+        for key, value in config_vars.items():
+            setattr(self, key, value)
+
+        # Validate the s3 options
+        self._validate_s3_configuration(self.s3)
+
+    def _record_user_provided_options(self, args, kwargs):
+        option_order = list(self.OPTION_DEFAULTS)
+        user_provided_options = {}
+
+        # Iterate through the kwargs passed through to the constructor and
+        # map valid keys to the dictionary
+        for key, value in kwargs.items():
+            if key in self.OPTION_DEFAULTS:
+                user_provided_options[key] = value
+            # The key must exist in the available options
+            else:
+                raise TypeError(
+                    'Got unexpected keyword argument \'%s\'' % key)
+
+        # The number of args should not be longer than the allowed
+        # options
+        if len(args) > len(option_order):
+            raise TypeError(
+                'Takes at most %s arguments (%s given)' % (
+                    len(option_order), len(args)))
+
+        # Iterate through the args passed through to the constructor and map
+        # them to appropriate keys.
+        for i, arg in enumerate(args):
+            # If it a kwarg was specified for the arg, then error out
+            if option_order[i] in user_provided_options:
+                raise TypeError(
+                    'Got multiple values for keyword argument \'%s\'' % (
+                        option_order[i]))
+            user_provided_options[option_order[i]] = arg
+
+        return user_provided_options
+
+    def _validate_s3_configuration(self, s3):
+        if s3 is not None:
+            addressing_style = s3.get('addressing_style')
+            if addressing_style not in ['virtual', 'auto', 'path', None]:
+                raise InvalidS3AddressingStyleError(
+                    s3_addressing_style=addressing_style)
+
+    def merge(self, other_config):
+        """Merges the config object with another config object
+
+        This will merge in all non-default values from the provided config
+        and return a new config object
+
+        :type other_config: botocore.client.Config
+        :param other config: Another config object to merge with. The values
+            in the provided config object will take precedence in the merging
+
+        :rtype: botocore.client.Config
+        :returns: A config object built from the merged values of both
+            config objects.
+        """
+        # Make a copy of the current attributes in the config object.
+        config_options = copy.copy(self._user_provided_options)
+
+        # Merge in the user provided options from the other config
+        config_options.update(other_config._user_provided_options)
+
+        # Return a new config object with the merged properties.
+        return Config(**config_options)

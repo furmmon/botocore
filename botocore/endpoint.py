@@ -25,6 +25,7 @@ from botocore.vendored import six
 from botocore.awsrequest import create_request_object
 from botocore.exceptions import BaseEndpointResolverError
 from botocore.exceptions import EndpointConnectionError
+from botocore.exceptions import ConnectionClosedError
 from botocore.compat import filter_ssl_warnings
 from botocore.utils import is_valid_endpoint_url
 from botocore.hooks import first_non_none_response
@@ -34,7 +35,6 @@ from botocore import parsers
 
 logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT = 60
-NOT_SET = object()
 filter_ssl_warnings()
 
 
@@ -96,6 +96,7 @@ class Endpoint(object):
         self.proxies = proxies
         self.http_session = PreserveAuthSession()
         self.timeout = timeout
+        logger.debug('Setting %s timeout as %s', endpoint_prefix, self.timeout)
         self._lock = threading.Lock()
         if response_parser_factory is None:
             response_parser_factory = parsers.ResponseParserFactory()
@@ -170,10 +171,16 @@ class Endpoint(object):
             # lookup issue, 99% of the time this is due to a misconfigured
             # region/endpoint so we'll raise a more specific error message
             # to help users.
+            logger.debug("ConnectionError received when sending HTTP request.",
+                         exc_info=True)
             if self._looks_like_dns_error(e):
                 endpoint_url = e.request.url
                 better_exception = EndpointConnectionError(
                     endpoint_url=endpoint_url, error=e)
+                return (None, better_exception)
+            elif self._looks_like_bad_status_line(e):
+                better_exception = ConnectionClosedError(
+                    endpoint_url=e.request.url, request=e.request)
                 return (None, better_exception)
             else:
                 return (None, e)
@@ -186,12 +193,15 @@ class Endpoint(object):
                                                  operation_model)
         parser = self._response_parser_factory.create_parser(
             operation_model.metadata['protocol'])
-        return ((http_response, parser.parse(response_dict,
-                                             operation_model.output_shape)),
+        return ((http_response,
+                 parser.parse(response_dict, operation_model.output_shape)),
                 None)
 
     def _looks_like_dns_error(self, e):
         return 'gaierror' in str(e) and e.request is not None
+
+    def _looks_like_bad_status_line(self, e):
+        return 'BadStatusLine' in str(e) and e.request is not None
 
     def _needs_retry(self, attempts, operation_model, response=None,
                      caught_exception=None):
@@ -221,7 +231,7 @@ class EndpointCreator(object):
 
     def create_endpoint(self, service_model, region_name=None, is_secure=True,
                         endpoint_url=None, verify=None,
-                        response_parser_factory=None):
+                        response_parser_factory=None, timeout=DEFAULT_TIMEOUT):
         if region_name is None:
             region_name = self._configured_region
         # Use the endpoint resolver heuristics to build the endpoint url.
@@ -247,16 +257,17 @@ class EndpointCreator(object):
             final_endpoint_url = endpoint['uri']
         if not is_valid_endpoint_url(final_endpoint_url):
             raise ValueError("Invalid endpoint: %s" % final_endpoint_url)
-        return self._get_endpoint(
-            service_model, final_endpoint_url, verify, response_parser_factory)
 
-    def _get_endpoint(self, service_model, endpoint_url,
-                      verify, response_parser_factory):
-        endpoint_prefix = service_model.endpoint_prefix
-        event_emitter = self._event_emitter
-        return self._get_endpoint_complex(endpoint_prefix, endpoint_url,
-                                          verify, event_emitter,
-                                          response_parser_factory)
+        proxies = self._get_proxies(final_endpoint_url)
+        verify_value = self._get_verify_value(verify)
+        return Endpoint(
+            final_endpoint_url,
+            endpoint_prefix=service_model.endpoint_prefix,
+            event_emitter=self._event_emitter,
+            proxies=proxies,
+            verify=verify_value,
+            timeout=timeout,
+            response_parser_factory=response_parser_factory)
 
     def _get_proxies(self, url):
         # We could also support getting proxies from a config file,
@@ -275,17 +286,3 @@ class EndpointCreator(object):
         # Otherwise use the value from REQUESTS_CA_BUNDLE, or default to
         # True if the env var does not exist.
         return os.environ.get('REQUESTS_CA_BUNDLE', True)
-
-    def _get_endpoint_complex(self, endpoint_prefix,
-                              endpoint_url, verify,
-                              event_emitter,
-                              response_parser_factory=None):
-        proxies = self._get_proxies(endpoint_url)
-        verify = self._get_verify_value(verify)
-        return Endpoint(
-            endpoint_url,
-            endpoint_prefix=endpoint_prefix,
-            event_emitter=event_emitter,
-            proxies=proxies,
-            verify=verify,
-            response_parser_factory=response_parser_factory)

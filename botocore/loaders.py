@@ -98,7 +98,7 @@ import os
 from botocore import BOTOCORE_ROOT
 from botocore.compat import json
 from botocore.compat import OrderedDict
-from botocore.exceptions import DataNotFoundError
+from botocore.exceptions import DataNotFoundError, UnknownServiceError
 
 
 def instance_cache(func):
@@ -153,8 +153,12 @@ class JSONFileLoader(object):
         full_path = file_path + '.json'
         if not os.path.isfile(full_path):
             return
-        with open(full_path) as fp:
-            return json.load(fp, object_pairs_hook=OrderedDict)
+
+        # By default the file will be opened with locale encoding on Python 3.
+        # We specify "utf8" here to ensure the correct behavior.
+        with open(full_path, 'rb') as fp:
+            payload = fp.read().decode('utf-8')
+            return json.loads(payload, object_pairs_hook=OrderedDict)
 
 
 def create_loader(search_path_string=None):
@@ -203,13 +207,13 @@ class Loader(object):
         if file_loader is None:
             file_loader = self.FILE_LOADER_CLASS()
         self.file_loader = file_loader
-        if include_default_search_paths:
-            self._search_paths = [self.CUSTOMER_DATA_PATH,
-                                  self.BUILTIN_DATA_PATH]
+        if extra_search_paths is not None:
+            self._search_paths = extra_search_paths
         else:
             self._search_paths = []
-        if extra_search_paths is not None:
-            self._search_paths.extend(extra_search_paths)
+        if include_default_search_paths:
+            self._search_paths.extend([self.CUSTOMER_DATA_PATH,
+                                       self.BUILTIN_DATA_PATH])
 
     @property
     def search_paths(self):
@@ -327,12 +331,21 @@ class Loader(object):
         :param api_version: The API version to load.  If this is not
             provided, then the latest API version will be used.
 
-        :return: The loaded data, or a DataNotFoundError if no data
-            could be found.
+        :raises: UnknownServiceError if there is no known service with
+            the provided service_name.
 
+        :raises: DataNotFoundError if no data could be found for the
+            service_name/type_name/api_version.
+
+        :return: The loaded data, as a python type (e.g. dict, list, etc).
         """
         # Wrapper around the load_data.  This will calculate the path
         # to call load_data with.
+        known_services = self.list_available_services('service-2')
+        if service_name not in known_services:
+            raise UnknownServiceError(
+                service_name=service_name,
+                known_service_names=', '.join(sorted(known_services)))
         if api_version is None:
             api_version = self.determine_latest_version(
                 service_name, type_name)

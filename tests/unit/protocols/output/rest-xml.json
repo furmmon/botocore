@@ -673,7 +673,7 @@
             "x-double": "1.5",
             "x-long": "100",
             "x-char": "a",
-            "x-timestamp": "Sun, 25 Jan 2015 08:00:00 -0000"
+            "x-timestamp": "Sun, 25 Jan 2015 08:00:00 GMT"
           },
           "body": ""
         }
@@ -714,6 +714,74 @@
           "headers": {},
           "body": "<OperationNameResponse><Foo/><RequestId>requestid</RequestId></OperationNameResponse>"
         }
+      }
+    ]
+  },
+  {
+    "description": "Parse XML Attributes",
+    "metadata": {
+      "protocol": "rest-xml"
+    },
+    "shapes": {
+      "OutputShape": {
+        "type": "structure",
+        "members": {
+          "Grants": {
+            "shape": "Grants",
+	    "locationName": "AccessControlList"
+          }
+        }
+      },
+      "Grants": {
+        "type": "list",
+	"member": {
+          "shape": "Grant"
+	}
+      },
+      "Grant": {
+        "type": "structure",
+	"members": {
+          "Grantee": {"shape": "Grantee"}
+	}
+      },
+      "Grantee": {
+        "type": "structure",
+	"members": {
+          "DisplayName": {"shape": "String"},
+          "ID": {"shape": "String"},
+          "Type": {
+            "shape": "String",
+	    "locationName": "xsi:type",
+	    "xmlAttribute": true
+	  }
+	}
+      },
+      "String": {"type": "string"}
+    },
+    "cases": [
+      {
+        "given": {
+          "output": {
+            "shape": "OutputShape"
+          },
+          "name": "OperationName"
+        },
+        "result": {
+          "Grants": [
+            {
+              "Grantee": {
+                "DisplayName": "name",
+                "ID": "id",
+                "Type": "CanonicalUser"
+              }
+            }
+          ]
+        },
+        "response": {
+          "status_code": 200,
+          "headers": {},
+          "body": "<OperationNameResponse><AccessControlList><Grant><Grantee xmlns:xsi=\"http://foo/bar\"  xsi:type=\"CanonicalUser\"><ID>id</ID> <DisplayName>name</DisplayName></Grantee></Grant></AccessControlList></OperationNameResponse>"
+	}
       }
     ]
   }

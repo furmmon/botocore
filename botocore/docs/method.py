@@ -124,8 +124,8 @@ def document_model_driven_method(section, method_name, operation_model,
                                  event_emitter, method_description=None,
                                  example_prefix=None, include_input=None,
                                  include_output=None, exclude_input=None,
-                                 exclude_output=None,
-                                 document_output=True):
+                                 exclude_output=None, document_output=True,
+                                 include_signature=True):
     """Documents an individual method
 
     :param section: The section to write to
@@ -158,11 +158,15 @@ def document_model_driven_method(section, method_name, operation_model,
 
     :param document_output: A boolean flag to indicate whether to
         document the output.
+
+    :param include_signature: Whether or not to include the signature.
+        It is useful for generating docstrings.
     """
-    # Add the signature.
-    document_model_driven_signature(
-        section, method_name, operation_model, include=include_input,
-        exclude=exclude_input)
+    # Add the signature if specified.
+    if include_signature:
+        document_model_driven_signature(
+            section, method_name, operation_model, include=include_input,
+            exclude=exclude_input)
 
     # Add the description for the method.
     method_intro_section = section.add_new_section('method-intro')
@@ -205,6 +209,8 @@ def document_model_driven_method(section, method_name, operation_model,
         return_section.style.indent()
         return_section.style.new_line()
 
+        context = {'streaming_shape': operation_model.get_streaming_output()}
+
         # Add an example return value
         return_example_section = return_section.add_new_section('example')
         return_example_section.style.new_line()
@@ -213,7 +219,8 @@ def document_model_driven_method(section, method_name, operation_model,
         ResponseExampleDocumenter(
             service_name=operation_model.service_model.service_name,
             operation_name=operation_model.name,
-            event_emitter=event_emitter).document_example(
+            event_emitter=event_emitter,
+            context=context).document_example(
                 return_example_section, operation_model.output_shape,
                 include=include_output, exclude=exclude_output)
 
@@ -226,7 +233,8 @@ def document_model_driven_method(section, method_name, operation_model,
         ResponseParamsDocumenter(
             service_name=operation_model.service_model.service_name,
             operation_name=operation_model.name,
-            event_emitter=event_emitter).document_params(
+            event_emitter=event_emitter,
+            context=context).document_params(
                 return_description_section, operation_model.output_shape,
                 include=include_output, exclude=exclude_output)
     else:

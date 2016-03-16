@@ -19,6 +19,8 @@ import tempfile
 import shutil
 import threading
 import mock
+from tarfile import TarFile
+from contextlib import closing
 
 from nose.plugins.attrib import attr
 
@@ -331,6 +333,20 @@ class TestS3Objects(TestS3BaseWithBucket):
             Bucket=self.bucket_name, Key=key_name)
         self.assertEqual(parsed['Body'].read().decode('utf-8'), 'foo')
 
+    def test_unicode_system_character(self):
+        # Verify we can use a unicode system character which would normally
+        # break the xml parser
+        key_name = 'foo\x08'
+        self.create_object(key_name)
+        parsed = self.client.list_objects(Bucket=self.bucket_name)
+        self.assertEqual(len(parsed['Contents']), 1)
+        self.assertEqual(parsed['Contents'][0]['Key'], key_name)
+
+        parsed = self.client.list_objects(Bucket=self.bucket_name,
+                                          EncodingType='url')
+        self.assertEqual(len(parsed['Contents']), 1)
+        self.assertEqual(parsed['Contents'][0]['Key'], 'foo%08')
+
     def test_thread_safe_auth(self):
         self.auth_paths = []
         self.session.register('before-sign', self.increment_auth)
@@ -403,6 +419,35 @@ class TestS3Copy(TestS3BaseWithBucket):
             Bucket=self.bucket_name, Key=key_name2)
         self.assertEqual(data['Body'].read().decode('utf-8'), 'foo')
 
+    def test_copy_with_query_string(self):
+        key_name = 'a+b/foo?notVersionid=bar'
+        self.create_object(key_name=key_name)
+
+        key_name2 = key_name + 'bar'
+        self.client.copy_object(
+            Bucket=self.bucket_name, Key=key_name2,
+            CopySource='%s/%s' % (self.bucket_name, key_name))
+
+        # Now verify we can retrieve the copied object.
+        data = self.client.get_object(
+            Bucket=self.bucket_name, Key=key_name2)
+        self.assertEqual(data['Body'].read().decode('utf-8'), 'foo')
+
+    def test_can_copy_with_dict_form(self):
+        key_name = 'a+b/foo?versionId=abcd'
+        self.create_object(key_name=key_name)
+
+        key_name2 = key_name + 'bar'
+        self.client.copy_object(
+            Bucket=self.bucket_name, Key=key_name2,
+            CopySource={'Bucket': self.bucket_name,
+                        'Key': key_name})
+
+        # Now verify we can retrieve the copied object.
+        data = self.client.get_object(
+            Bucket=self.bucket_name, Key=key_name2)
+        self.assertEqual(data['Body'].read().decode('utf-8'), 'foo')
+
     def test_copy_with_s3_metadata(self):
         key_name = 'foo.txt'
         self.create_object(key_name=key_name)
@@ -449,6 +494,17 @@ class TestS3PresignUsStandard(BaseS3PresignTest):
             "got: %s" % presigned_url)
         # Try to retrieve the object using the presigned url.
         self.assertEqual(requests.get(presigned_url).content, b'foo')
+
+    def test_presign_with_existing_query_string_values(self):
+        content_disposition = 'attachment; filename=foo.txt;'
+        presigned_url = self.client.generate_presigned_url(
+            'get_object', Params={
+                'Bucket': self.bucket_name, 'Key': self.key,
+                'ResponseContentDisposition': content_disposition})
+        response = requests.get(presigned_url)
+        self.assertEqual(response.headers['Content-Disposition'],
+                         content_disposition)
+        self.assertEqual(response.content, b'foo')
 
     def test_presign_sigv4(self):
         self.client_config.signature_version = 's3v4'
@@ -809,6 +865,40 @@ class TestSSEKeyParamValidation(BaseS3ClientTest):
                                    SSECustomerKey=key_str)['Body'].read(),
             b'mycontents2')
 
+    def test_make_request_with_sse_copy_source(self):
+        encrypt_key = 'a' * 32
+        other_encrypt_key = 'b' * 32
+
+        # Upload the object using one encrypt key
+        self.client.put_object(
+            Bucket=self.bucket_name, Key='foo.txt',
+            Body=six.BytesIO(b'mycontents'), SSECustomerAlgorithm='AES256',
+            SSECustomerKey=encrypt_key)
+        self.addCleanup(self.client.delete_object,
+                        Bucket=self.bucket_name, Key='foo.txt')
+
+        # Copy the object using the original encryption key as the copy source
+        # and encrypt with a new encryption key.
+        self.client.copy_object(
+            Bucket=self.bucket_name,
+            CopySource=self.bucket_name+'/foo.txt',
+            Key='bar.txt', CopySourceSSECustomerAlgorithm='AES256',
+            CopySourceSSECustomerKey=encrypt_key,
+            SSECustomerAlgorithm='AES256',
+            SSECustomerKey=other_encrypt_key
+        )
+        self.addCleanup(self.client.delete_object,
+                        Bucket=self.bucket_name, Key='bar.txt')
+
+        # Download the object using the new encryption key.
+        # The content should not have changed.
+        self.assertEqual(
+            self.client.get_object(
+                Bucket=self.bucket_name, Key='bar.txt',
+                SSECustomerAlgorithm='AES256',
+                SSECustomerKey=other_encrypt_key)['Body'].read(),
+            b'mycontents')
+
 
 class TestS3UTF8Headers(BaseS3ClientTest):
     def test_can_set_utf_8_headers(self):
@@ -854,12 +944,84 @@ class TestSupportedPutObjectBodyTypes(TestS3BaseWithBucket):
         with open(filename, 'rb') as binary_file:
             self.assert_can_put_object(body=binary_file)
 
+    def test_can_put_extracted_file_from_tar(self):
+        tempdir = self.make_tempdir()
+        tarname = os.path.join(tempdir, 'mytar.tar')
+        filename = os.path.join(tempdir, 'foo')
+
+        # Set up a file to add the tarfile.
+        with open(filename, 'w') as f:
+            f.write('bar')
+
+        # Setup the tar file by adding the file to it.
+        # Note there is no context handler for TarFile in python 2.6
+        try:
+            tar = TarFile(tarname, 'w')
+            tar.add(filename, 'foo')
+        finally:
+            tar.close()
+
+        # See if an extracted file can be uploaded to s3.
+        try:
+            tar = TarFile(tarname, 'r')
+            with closing(tar.extractfile('foo')) as f:
+                self.assert_can_put_object(body=f)
+        finally:
+            tar.close()
+
 
 class TestSupportedPutObjectBodyTypesSigv4(TestSupportedPutObjectBodyTypes):
     def create_client(self):
         client_config = Config(signature_version='s3v4')
         return self.session.create_client('s3', self.region,
                                           config=client_config)
+
+
+class TestAutoS3Addressing(BaseS3ClientTest):
+    def setUp(self):
+        super(TestAutoS3Addressing, self).setUp()
+        self.region = 'us-west-2'
+        self.addressing_style = 'auto'
+        self.client = self.create_client()
+
+    def create_client(self):
+        return self.session.create_client(
+            's3', region_name=self.region,
+            config=Config(s3={'addressing_style': self.addressing_style}))
+
+    def test_can_list_buckets(self):
+        response = self.client.list_buckets()
+        self.assertIn('Buckets', response)
+
+    def test_can_make_bucket_and_put_object(self):
+        bucket_name = self.create_bucket(self.region)
+        response = self.client.put_object(
+            Bucket=bucket_name, Key='foo', Body='contents')
+        self.assertEqual(
+            response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    def test_can_make_bucket_and_put_object_with_sigv4(self):
+        self.region = 'eu-central-1'
+        self.client = self.create_client()
+        bucket_name = self.create_bucket(self.region)
+        response = self.client.put_object(
+            Bucket=bucket_name, Key='foo', Body='contents')
+        self.assertEqual(
+            response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+
+class TestS3VirtualAddressing(TestAutoS3Addressing):
+    def setUp(self):
+        super(TestS3VirtualAddressing, self).setUp()
+        self.addressing_style = 'virtual'
+        self.client = self.create_client()
+
+
+class TestS3PathAddressing(TestAutoS3Addressing):
+    def setUp(self):
+        super(TestS3PathAddressing, self).setUp()
+        self.addressing_style = 'path'
+        self.client = self.create_client()
 
 
 if __name__ == '__main__':

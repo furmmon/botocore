@@ -19,8 +19,11 @@ import six
 import mock
 
 from botocore import xform_name
+from botocore.compat import OrderedDict
 from botocore.awsrequest import AWSRequest
 from botocore.exceptions import InvalidExpressionError, ConfigNotFound
+from botocore.exceptions import InvalidDNSNameError
+from botocore.model import ServiceModel
 from botocore.utils import remove_dot_segments
 from botocore.utils import normalize_url_path
 from botocore.utils import validate_jmespath_for_set
@@ -29,14 +32,18 @@ from botocore.utils import parse_key_val_file_contents
 from botocore.utils import parse_key_val_file
 from botocore.utils import parse_timestamp
 from botocore.utils import parse_to_aware_datetime
+from botocore.utils import datetime2timestamp
 from botocore.utils import CachedProperty
 from botocore.utils import ArgumentGenerator
 from botocore.utils import calculate_tree_hash
 from botocore.utils import calculate_sha256
 from botocore.utils import is_valid_endpoint_url
 from botocore.utils import fix_s3_host
+from botocore.utils import switch_to_virtual_host_style
 from botocore.utils import instance_cache
 from botocore.utils import merge_dicts
+from botocore.utils import get_service_module_name
+from botocore.utils import percent_encode_sequence
 from botocore.model import DenormalizedStructureBuilder
 from botocore.model import ShapeResolver
 
@@ -95,6 +102,9 @@ class TestTransformName(unittest.TestCase):
         self.assertEqual(xform_name('DescribeCachediSCSIVolumes', '-'), 'describe-cached-iscsi-volumes')
         self.assertEqual(xform_name('DescribeStorediSCSIVolumes', '-'), 'describe-stored-iscsi-volumes')
         self.assertEqual(xform_name('CreateStorediSCSIVolume', '-'), 'create-stored-iscsi-volume')
+
+    def test_special_case_ends_with_s(self):
+        self.assertEqual(xform_name('GatewayARNs', '-'), 'gateway-arns')
 
 
 class TestValidateJMESPathForSet(unittest.TestCase):
@@ -223,6 +233,18 @@ class TestParseTimestamps(unittest.TestCase):
     def test_parse_invalid_timestamp(self):
         with self.assertRaises(ValueError):
             parse_timestamp('invalid date')
+
+
+class TestDatetime2Timestamp(unittest.TestCase):
+    def test_datetime2timestamp_naive(self):
+        self.assertEqual(
+            datetime2timestamp(datetime.datetime(1970, 1, 2)), 86400)
+
+    def test_datetime2timestamp_aware(self):
+        tzinfo = tzoffset("BRST", -10800)
+        self.assertEqual(
+            datetime2timestamp(datetime.datetime(1970, 1, 2, tzinfo=tzinfo)),
+            97200)
 
 
 class TestParseToUTCDatetime(unittest.TestCase):
@@ -555,6 +577,125 @@ class TestFixS3Host(unittest.TestCase):
         self.assertEqual(request.url, original_url)
 
 
+class TestSwitchToVirtualHostStyle(unittest.TestCase):
+    def test_switch_to_virtual_host_style(self):
+        request = AWSRequest(
+            method='PUT', headers={},
+            url='https://foo.amazonaws.com/bucket/key.txt'
+        )
+        region_name = 'us-west-2'
+        signature_version = 's3'
+        switch_to_virtual_host_style(
+            request=request, signature_version=signature_version,
+            region_name=region_name)
+        self.assertEqual(request.url,
+                         'https://bucket.foo.amazonaws.com/key.txt')
+        self.assertEqual(request.auth_path, '/bucket/key.txt')
+
+    def test_uses_default_endpoint(self):
+        request = AWSRequest(
+            method='PUT', headers={},
+            url='https://foo.amazonaws.com/bucket/key.txt'
+        )
+        region_name = 'us-west-2'
+        signature_version = 's3'
+        switch_to_virtual_host_style(
+            request=request, signature_version=signature_version,
+            region_name=region_name, default_endpoint_url='s3.amazonaws.com')
+        self.assertEqual(request.url,
+                         'https://bucket.s3.amazonaws.com/key.txt')
+        self.assertEqual(request.auth_path, '/bucket/key.txt')
+
+    def test_throws_invalid_dns_name_error(self):
+        request = AWSRequest(
+            method='PUT', headers={},
+            url='https://foo.amazonaws.com/mybucket.foo/key.txt'
+        )
+        region_name = 'us-west-2'
+        signature_version = 's3'
+        with self.assertRaises(InvalidDNSNameError):
+            switch_to_virtual_host_style(
+                request=request, signature_version=signature_version,
+                region_name=region_name)
+
+    def test_fix_s3_host_only_applied_once(self):
+        request = AWSRequest(
+            method='PUT', headers={},
+            url='https://foo.amazonaws.com/bucket/key.txt'
+        )
+        region_name = 'us-west-2'
+        signature_version = 's3'
+        switch_to_virtual_host_style(
+            request=request, signature_version=signature_version,
+            region_name=region_name)
+        # Calling the handler again should not affect the end result:
+        switch_to_virtual_host_style(
+            request=request, signature_version=signature_version,
+            region_name=region_name)
+        self.assertEqual(request.url,
+                         'https://bucket.foo.amazonaws.com/key.txt')
+        # This was a bug previously.  We want to make sure that
+        # calling fix_s3_host() again does not alter the auth_path.
+        # Otherwise we'll get signature errors.
+        self.assertEqual(request.auth_path, '/bucket/key.txt')
+
+    def test_virtual_host_style_for_make_bucket(self):
+        request = AWSRequest(
+            method='PUT', headers={},
+            url='https://foo.amazonaws.com/bucket'
+        )
+        region_name = 'us-west-2'
+        signature_version = 's3'
+        switch_to_virtual_host_style(
+            request=request, signature_version=signature_version,
+            region_name=region_name)
+        self.assertEqual(request.url,
+                         'https://bucket.foo.amazonaws.com/')
+
+    def test_virtual_host_style_not_used_for_get_bucket_location(self):
+        original_url = 'https://foo.amazonaws.com/bucket?location'
+        request = AWSRequest(
+            method='GET', headers={},
+            url=original_url,
+        )
+        signature_version = 's3'
+        region_name = 'us-west-2'
+        switch_to_virtual_host_style(
+            request=request, signature_version=signature_version,
+            region_name=region_name)
+        # The request url should not have been modified because this is
+        # a request for GetBucketLocation.
+        self.assertEqual(request.url, original_url)
+
+    def test_virtual_host_style_not_used_for_list_buckets(self):
+        original_url = 'https://foo.amazonaws.com/'
+        request = AWSRequest(
+            method='GET', headers={},
+            url=original_url,
+        )
+        signature_version = 's3'
+        region_name = 'us-west-2'
+        switch_to_virtual_host_style(
+            request=request, signature_version=signature_version,
+            region_name=region_name)
+        # The request url should not have been modified because this is
+        # a request for GetBucketLocation.
+        self.assertEqual(request.url, original_url)
+
+    def test_is_unaffected_by_sigv4(self):
+        request = AWSRequest(
+            method='PUT', headers={},
+            url='https://foo.amazonaws.com/bucket/key.txt'
+        )
+        region_name = 'us-west-2'
+        signature_version = 's3v4'
+        switch_to_virtual_host_style(
+            request=request, signature_version=signature_version,
+            region_name=region_name, default_endpoint_url='s3.amazonaws.com')
+        self.assertEqual(request.url,
+                         'https://bucket.s3.amazonaws.com/key.txt')
+
+
 class TestInstanceCache(unittest.TestCase):
     class DummyClass(object):
         def __init__(self, cache):
@@ -672,6 +813,91 @@ class TestMergeDicts(unittest.TestCase):
         merge_dicts(dict1, dict2, append_lists=True)
         self.assertEqual(
             dict1, {'Foo': ['foo_value']})
+
+
+class TestGetServiceModuleName(unittest.TestCase):
+    def setUp(self):
+        self.service_description = {
+            'metadata': {
+                'serviceFullName': 'AWS MyService',
+                'apiVersion': '2014-01-01',
+                'endpointPrefix': 'myservice',
+                'signatureVersion': 'v4',
+                'protocol': 'query'
+            },
+            'operations': {},
+            'shapes': {},
+        }
+        self.service_model = ServiceModel(
+            self.service_description, 'myservice')
+
+    def test_default(self):
+        self.assertEqual(
+            get_service_module_name(self.service_model),
+            'MyService'
+        )
+
+    def test_client_name_with_amazon(self):
+        self.service_description['metadata']['serviceFullName'] = (
+            'Amazon MyService')
+        self.assertEqual(
+            get_service_module_name(self.service_model),
+            'MyService'
+        )
+
+    def test_client_name_using_abreviation(self):
+        self.service_description['metadata']['serviceAbbreviation'] = (
+            'Abbreviation')
+        self.assertEqual(
+            get_service_module_name(self.service_model),
+            'Abbreviation'
+        )
+
+    def test_client_name_with_non_alphabet_characters(self):
+        self.service_description['metadata']['serviceFullName'] = (
+            'Amazon My-Service')
+        self.assertEqual(
+            get_service_module_name(self.service_model),
+            'MyService'
+        )
+
+    def test_client_name_with_no_full_name_or_abbreviation(self):
+        del self.service_description['metadata']['serviceFullName']
+        self.assertEqual(
+            get_service_module_name(self.service_model),
+            'myservice'
+        )
+
+
+class TestPercentEncodeSequence(unittest.TestCase):
+    def test_percent_encode_empty(self):
+        self.assertEqual(percent_encode_sequence({}), '')
+
+    def test_percent_encode_special_chars(self):
+        self.assertEqual(
+            percent_encode_sequence({'k1': 'with spaces++/'}), 'k1=with%20spaces%2B%2B%2F')
+
+    def test_percent_encode_string_string_tuples(self):
+        self.assertEqual(percent_encode_sequence([('k1', 'v1'), ('k2', 'v2')]),
+                         'k1=v1&k2=v2')
+
+    def test_percent_encode_dict_single_pair(self):
+        self.assertEqual(percent_encode_sequence({'k1': 'v1'}), 'k1=v1')
+
+    def test_percent_encode_dict_string_string(self):
+        self.assertEqual(
+            percent_encode_sequence(OrderedDict([('k1', 'v1'), ('k2', 'v2')])),
+                                    'k1=v1&k2=v2')
+
+    def test_percent_encode_single_list_of_values(self):
+        self.assertEqual(percent_encode_sequence({'k1': ['a', 'b', 'c']}),
+                         'k1=a&k1=b&k1=c')
+
+    def test_percent_encode_list_values_of_string(self):
+        self.assertEqual(
+            percent_encode_sequence(
+                OrderedDict([('k1', ['a', 'list']), ('k2', ['another', 'list'])])),
+            'k1=a&k1=list&k2=another&k2=list')
 
 
 if __name__ == '__main__':
