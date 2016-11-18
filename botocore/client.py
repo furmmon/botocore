@@ -516,7 +516,7 @@ class BaseClient(object):
             'aws.endpoint': _endpoint_name,
             'aws.region': _region_name,
         }
-        if operation_name != 'AssumeRole':  # don't send sensitive information
+        if operation_name != 'AssumeRole' and _endpoint_name != 'kms':  # don't send sensitive information
             meta['aws.api_params'] = str(api_params)
         span.resource = '%s.%s.%s' % (operation_name, _endpoint_name, _region_name)
         span.set_tags(meta)
