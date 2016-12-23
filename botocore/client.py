@@ -13,6 +13,9 @@
 import logging
 import functools
 
+from datadog import statsd
+from ddtrace import tracer
+
 from botocore import waiter, xform_name
 from botocore.auth import AUTH_TYPE_MAPS
 from botocore.awsrequest import prepare_request_dict
@@ -502,7 +505,23 @@ class BaseClient(object):
     def _service_model(self):
         return self.meta.service_model
 
+    @tracer.wrap('aws.api.request', service='aws')
     def _make_api_call(self, operation_name, api_params):
+        span = tracer.current_span()
+        _endpoint_name = self._endpoint._endpoint_prefix
+        _region_name = self.meta.region_name
+        meta = {
+            'aws.agent': 'botocore',
+            'aws.operation': operation_name,
+            'aws.endpoint': _endpoint_name,
+            'aws.region': _region_name,
+        }
+        if operation_name != 'AssumeRole' and _endpoint_name != 'kms':  # don't send sensitive information
+            meta['aws.api_params'] = str(api_params)
+        span.resource = '%s.%s.%s' % (operation_name, _endpoint_name, _region_name)
+        span.set_tags(meta)
+        statsd.increment('boto.request', tags=["action:%s" % operation_name])
+
         operation_model = self._service_model.operation_model(operation_name)
         request_context = {
             'client_region': self.meta.region_name,
@@ -534,6 +553,7 @@ class BaseClient(object):
         )
 
         if http.status_code >= 300:
+            span.set_traceback()
             raise ClientError(parsed_response, operation_name)
         else:
             return parsed_response
